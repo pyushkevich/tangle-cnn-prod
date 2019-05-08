@@ -1,0 +1,3 @@
+[submodule "wildcat.pytorch"]
+	path = wildcat.pytorch
+	url = https://github.com/durandtibo/wildcat.pytorch.git
