@@ -1,6 +1,6 @@
 numpy
 scipy
-torch
+torch>=0.4.0
 torchvision
 matplotlib
 openslide-python
