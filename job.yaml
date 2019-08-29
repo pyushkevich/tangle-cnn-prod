@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: hist-torch-job-XXX
+  name: hist-torch-job-%SVS%
 spec:
   template:
     metadata:
@@ -15,7 +15,7 @@ spec:
       - name: my-gpu-container-torch
         image: pyushkevich/tangle-cnn-prod:latest
         command: ["/bin/bash"]
-        args: ["process_slide_full.sh", "cfn-cluster-test", "gs://svsbucket/UP5_18_HL4P_21.tif", "gs://svsbucket/UP5_18_HL4P_21_tangles.nii.gz", "gs://svsbucket/model_wildcat_upsample/"]
+        args: ["process_slide_full.sh", "cfn-cluster-test", "gs://svsbucket/%SVSFILE%", "gs://svsbucket/%SVS%_tangle_density.nii.gz", "gs://svsbucket/model_wildcat_upsample/"]
         resources:
           limits:
             nvidia.com/gpu: 1
