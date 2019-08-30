@@ -12,7 +12,7 @@ gcloud auth activate-service-account --key-file /var/secrets/google/key.json
 gcloud config set project $project_id
 
 # Download the SVS
-mkdir -p ./data
+mkdir -p ./data ./model
 if ! gsutil cp "gs://mtl_histology/$id/histo_raw/${svs}.*" ./data/; then
   echo "Download of SVS file failed for $id $svs"
   exit -1
