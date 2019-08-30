@@ -1,27 +1,40 @@
 #!/bin/bash
-PROJECT_ID=${1?}
-SRC_URL=${2?}
-TRG_URL=${3?}
-MODEL_URL=${4?}
+set -x -e
+
+project_id=${1?}
+id=${2?}
+svs=${3?}
+stain=${4?}
+model=${5?}
 
 # Activate service account
 gcloud auth activate-service-account --key-file /var/secrets/google/key.json
+gcloud config set project $project_id
 
-# Set default project
-gcloud config set project $PROJECT_ID
+# Download the SVS
+mkdir -p ./data
+if ! gsutil cp "gs://mtl_histology/$id/histo_raw/${svs}.*" ./data/; then
+  echo "Download of SVS file failed for $id $svs"
+  exit -1
+fi
 
-# Copy the model into desired location
-mkdir -p model data
-gsutil cp -r $MODEL_URL ./model/
+# Find the file
+svslocal=$(ls ./data/${svs}.*)
 
-# Copy the data to the data location
-gsutil cp $SRC_URL ./data
-SLIDE=./data/$(ls -tr ./data | tail -n 1)
+# Form the model URL
+MODEL_URL="gs://svsbucket/cnn_models/$stain/$model"
+if ! gsutil cp "${MODEL_URL}/*" ./model/; then
+  echo "Download failed for $MODEL_URL"
+  exit -1
+fi
 
 # Run the code
-python scan_tangles.py apply --slide $SLIDE --output ./data/result.nii.gz \
-  --network ./model/model_wildcat_upsample 
+python scan_tangles.py apply \
+  --slide $svslocal \
+  --output ./data/result.nii.gz \
+  --network ./model
 
-# Upload the result
+# Copy result
+TRG_URL="gs://mtl_histology/$id/histo_proc/${svs}/density/${svs}_${stain}_${model}_densitymap.nii.gz"
 gsutil cp ./data/result.nii.gz $TRG_URL
 
