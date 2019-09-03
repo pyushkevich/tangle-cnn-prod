@@ -87,7 +87,8 @@ def do_apply(args):
     # Load the resnet model
     model_resnet.fc = nn.Linear(model_resnet.fc.in_features, cf_resnet['num_classes'])
     model_resnet.load_state_dict(torch.load(
-        os.path.join(args.network, 'resnet.dat')))
+        os.path.join(args.network, 'resnet.dat'),
+        map_location=device))
     model_resnet.eval()
     model_resnet = model_resnet.to(device)
 
@@ -102,7 +103,9 @@ def do_apply(args):
             num_maps=cf_wildcat['num_maps'])
 
     model_wildcat.load_state_dict(
-            torch.load(os.path.join(args.network, 'wildcat_upsample.dat')))
+            torch.load(
+                os.path.join(args.network, 'wildcat_upsample.dat'),
+                map_location=device))
 
     # Set evaluation mode
     model_wildcat.eval()
@@ -273,7 +276,9 @@ def do_apply(args):
                 (u,v,len(hits),t1-t0,t2-t1,t3-t2,t3-t0))
 
     # Done with thread
-    worker.join()
+    worker.join(60)
+    if worker.isAlive():
+        print('Thread worker failed to terminate after 60 seconds')
 
     # Set the spacing based on openslide
     # Get the image spacing from the header, in mm units
