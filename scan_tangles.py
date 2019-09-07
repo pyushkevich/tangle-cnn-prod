@@ -119,16 +119,16 @@ def do_apply(args):
     osl=openslide.OpenSlide(args.slide)
 
     # The step by which the sampling window is slid (in raw pixels)
-    stride = 100
+    stride = config['stride']
 
     # Window size in strides (e.g., 400 pixels)
-    window_size=4
+    window_size=config['window_size']
 
     # Amount of overhang
     overhang=(window_size-1)*stride
 
     # Desired number of windows per chunk of SVS loaded into memory at once
-    chunk_size=40
+    chunk_size=config['chunk_size']
 
     # Actual chunk size (without overhang)
     chunk_width=stride * chunk_size
@@ -142,16 +142,20 @@ def do_apply(args):
     # Scaling factor for output pixels, how many output pixels for every wildcat
     # output pixel. This is needed because for stride of 100, there would be a 
     # non-integer number of output pixels (14/4). 
-    out_scale = 1.0 / 8
+    out_scale = 0.5
 
     # Size of output pixel (in input pixels)
     out_pix_size = wildcat_shrinkage * window_size * stride / (cf_wildcat['input_size'] * out_scale)
+    print('Output pixel size is %f times the input pixel size' % out_pix_size)
 
     # Output image size 
     out_dim=(slide_dim/out_pix_size).astype(int)
 
+    # Padded output image size, to prevent issues at the border
+    out_dim_pad = out_dim + round(1 + stride / out_pix_size)
+
     # Output array (last dimension is per-class probabilities)
-    density=np.zeros((2, out_dim[0], out_dim[1]))
+    density=np.zeros((2, out_dim_pad[0], out_dim_pad[1]))
 
     # Range of pixels to scan
     u_range,v_range = (0,slide_dim[0]),(0,slide_dim[1])
@@ -270,8 +274,12 @@ def do_apply(args):
                     for m in range (j, j_end):
                         u_out = round((u + stride * hits[m][0]) / out_pix_size)
                         v_out = round((v + stride * hits[m][1]) / out_pix_size)
-                        density[0, u_out:u_out+w,v_out:v_out+w] += x_cpool_up[m-j,0,:,:].detach().cpu().numpy().transpose()
-                        density[1, u_out:u_out+w,v_out:v_out+w] += x_cpool_up[m-j,1,:,:].detach().cpu().numpy().transpose()
+                        try:
+                            density[0, u_out:u_out+w,v_out:v_out+w] += x_cpool_up[m-j,0,:,:].detach().cpu().numpy().transpose()
+                            density[1, u_out:u_out+w,v_out:v_out+w] += x_cpool_up[m-j,1,:,:].detach().cpu().numpy().transpose()
+                        except ValueError:
+                            print('ValueError raised')
+                            traceback.print_exc()
 
             # Finished first pass through the chunk
             t3 = timeit.default_timer()
@@ -309,6 +317,9 @@ def do_apply(args):
 
     # Report spacing information
     print("Spacing of the mri-like image: %gx%gmm\n" % (sx, sy))
+
+    # Trim the output array to actual size
+    density = density[0:out_dim[0], 0:out_dim[1]]
 
     # Write the result as a NIFTI file
     nii = sitk.GetImageFromArray(np.transpose(density, (2,1,0)), True)
