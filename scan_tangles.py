@@ -21,6 +21,8 @@ import json
 import SimpleITK as sitk
 import threading
 import queue
+import parse
+import traceback
 
 # Import wildcat models
 sys.path.append("wildcat.pytorch")
@@ -171,109 +173,117 @@ def do_apply(args):
     # Read stuff from queue
     while True:
 
-        # Read a tuple from the queue
-        t0 = timeit.default_timer()
-        q_data = chunk_q.get()
-        t1 = timeit.default_timer()
+        # Try/catch block should terminate program
+        try:
 
-        # Check for sentinel value
-        if q_data is None:
-            break
+            # Read a tuple from the queue
+            t0 = timeit.default_timer()
+            q_data = chunk_q.get()
+            t1 = timeit.default_timer()
 
-        # Get the offset of the read image, etc
-        (u, v) = q_data[0]
-        win_dim_ohang = q_data[1]
+            # Check for sentinel value
+            if q_data is None:
+                break
 
-        # Get the read image
-        chunk_img = q_data[2]
+            # Get the offset of the read image, etc
+            (u, v) = q_data[0]
+            win_dim_ohang = q_data[1]
 
-        # Resample the chunk for the two networks
-        win_dim_ohang_resnet = win_dim_ohang * cf_resnet['input_size'] / (stride * window_size)        
-        tran_resnet = transforms.Compose([
-            transforms.Resize(int(min(win_dim_ohang_resnet))),
-            transforms.ToTensor(),
-            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-            ])
+            # Get the read image
+            chunk_img = q_data[2]
 
-        # Stride width for resnet (1/4 of 224)
-        stride_t = int(cf_resnet['input_size'] / window_size)
-
-        # Convert the read chunk to tensor format
-        chunk_tensor=tran_resnet(chunk_img).to(device)
-        chunk_ufold=chunk_tensor.unfold(1,cf_resnet['input_size'],stride_t).unfold(2,cf_resnet['input_size'],stride_t).permute((1,2,0,3,4))
-
-        # Create array of windows that are hits
-        hits=[]
-
-        # Iterate over windows
-        for i in range(0, chunk_ufold.shape[1]):
-            for k in range(0, chunk_ufold.shape[0], args.bsr):
-
-                # Process the batch
-                k_range = range(k,min(k+args.bsr, chunk_ufold.shape[0]))
-                y_ik = model_resnet(chunk_ufold[k_range,i,:,:,:]).cpu().detach().numpy()
-
-                # Record all the hits in this batch
-                for j in k_range:
-                    if np.argmax(y_ik[j-k,:]) > 0:
-                        hits.append([i, j])
-
-        # Finished first pass through the chunk
-        t2 = timeit.default_timer()
-
-        # If there are hits, perform wildcat refinement
-        if len(hits) > 0:
-
-            # Resample the chunk for the wildcat network
-            win_dim_ohang_wildcat = win_dim_ohang * cf_wildcat['input_size'] / (stride * window_size)        
-            tran_wildcat = transforms.Compose([
-                transforms.Resize(int(min(win_dim_ohang_wildcat))),
+            # Resample the chunk for the two networks
+            win_dim_ohang_resnet = win_dim_ohang * cf_resnet['input_size'] / (stride * window_size)        
+            tran_resnet = transforms.Compose([
+                transforms.Resize(int(min(win_dim_ohang_resnet))),
                 transforms.ToTensor(),
                 transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
                 ])
 
-            # Stride width for resnet (1/4 of 448)
-            stride_t_wildcat = int(cf_wildcat['input_size'] / window_size)
+            # Stride width for resnet (1/4 of 224)
+            stride_t = int(cf_resnet['input_size'] / window_size)
 
-            # Convert the read chunk to tensor format and unfold
-            chunk_tensor_wildcat=tran_wildcat(chunk_img).to(device)
-            chunk_ufold_wildcat=chunk_tensor_wildcat.unfold(
-                    1,cf_wildcat['input_size'],stride_t_wildcat).unfold(
-                            2,cf_wildcat['input_size'],stride_t_wildcat).permute((1,2,0,3,4))
+            # Convert the read chunk to tensor format
+            chunk_tensor=tran_resnet(chunk_img).to(device)
+            chunk_ufold=chunk_tensor.unfold(1,cf_resnet['input_size'],stride_t).unfold(2,cf_resnet['input_size'],stride_t).permute((1,2,0,3,4))
 
-            # Stack the tensors
-            hit_folds=[]
-            for h in hits:
-                hit_folds.append(chunk_ufold_wildcat[h[1],h[0],:,:,:])
+            # Create array of windows that are hits
+            hits=[]
 
-            hit_sausage=torch.stack(hit_folds)
+            # Iterate over windows
+            for i in range(0, chunk_ufold.shape[1]):
+                for k in range(0, chunk_ufold.shape[0], args.bsr):
 
-            # Process by batches
-            for j in range(0, len(hits), args.bsw):
-                j_end = min(j+args.bsw, len(hits))
+                    # Process the batch
+                    k_range = range(k,min(k+args.bsr, chunk_ufold.shape[0]))
+                    y_ik = model_resnet(chunk_ufold[k_range,i,:,:,:]).cpu().detach().numpy()
 
-                # Forward pass through the wildcat model
-                # x_feat = model_wildcat.features(hit_sausage[j:j_end,:,:,:])
-                x_clas = model_wildcat.forward_to_classifier(hit_sausage[j:j_end,:,:,:])
-                x_cpool = model_wildcat.spatial_pooling.class_wise(x_clas)
+                    # Record all the hits in this batch
+                    for j in k_range:
+                        if np.argmax(y_ik[j-k,:]) > 0:
+                            hits.append([i, j])
 
-                # Scale the cpool image
-                x_cpool_up = torch.nn.functional.interpolate(x_cpool, scale_factor=out_scale)
-                w = x_cpool_up.shape[3]
+            # Finished first pass through the chunk
+            t2 = timeit.default_timer()
 
-                # Output index for the current hit
-                for m in range (j, j_end):
-                    u_out = round((u + stride * hits[m][0]) / out_pix_size)
-                    v_out = round((v + stride * hits[m][1]) / out_pix_size)
-                    density[0, u_out:u_out+w,v_out:v_out+w] += x_cpool_up[m-j,0,:,:].detach().cpu().numpy().transpose()
-                    density[1, u_out:u_out+w,v_out:v_out+w] += x_cpool_up[m-j,1,:,:].detach().cpu().numpy().transpose()
+            # If there are hits, perform wildcat refinement
+            if len(hits) > 0:
 
-        # Finished first pass through the chunk
-        t3 = timeit.default_timer()
+                # Resample the chunk for the wildcat network
+                win_dim_ohang_wildcat = win_dim_ohang * cf_wildcat['input_size'] / (stride * window_size)        
+                tran_wildcat = transforms.Compose([
+                    transforms.Resize(int(min(win_dim_ohang_wildcat))),
+                    transforms.ToTensor(),
+                    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+                    ])
 
-        # At this point we have a list of hits for this chunk
-        print("Chunk: (%6d,%6d) Hits: %4d Times: IO=%6.4f ResN=%6.4f WldC=%6.4f Totl=%8.4f" %
-                (u,v,len(hits),t1-t0,t2-t1,t3-t2,t3-t0))
+                # Stride width for resnet (1/4 of 448)
+                stride_t_wildcat = int(cf_wildcat['input_size'] / window_size)
+
+                # Convert the read chunk to tensor format and unfold
+                chunk_tensor_wildcat=tran_wildcat(chunk_img).to(device)
+                chunk_ufold_wildcat=chunk_tensor_wildcat.unfold(
+                        1,cf_wildcat['input_size'],stride_t_wildcat).unfold(
+                                2,cf_wildcat['input_size'],stride_t_wildcat).permute((1,2,0,3,4))
+
+                # Stack the tensors
+                hit_folds=[]
+                for h in hits:
+                    hit_folds.append(chunk_ufold_wildcat[h[1],h[0],:,:,:])
+
+                hit_sausage=torch.stack(hit_folds)
+
+                # Process by batches
+                for j in range(0, len(hits), args.bsw):
+                    j_end = min(j+args.bsw, len(hits))
+
+                    # Forward pass through the wildcat model
+                    # x_feat = model_wildcat.features(hit_sausage[j:j_end,:,:,:])
+                    x_clas = model_wildcat.forward_to_classifier(hit_sausage[j:j_end,:,:,:])
+                    x_cpool = model_wildcat.spatial_pooling.class_wise(x_clas)
+
+                    # Scale the cpool image
+                    x_cpool_up = torch.nn.functional.interpolate(x_cpool, scale_factor=out_scale)
+                    w = x_cpool_up.shape[3]
+
+                    # Output index for the current hit
+                    for m in range (j, j_end):
+                        u_out = round((u + stride * hits[m][0]) / out_pix_size)
+                        v_out = round((v + stride * hits[m][1]) / out_pix_size)
+                        density[0, u_out:u_out+w,v_out:v_out+w] += x_cpool_up[m-j,0,:,:].detach().cpu().numpy().transpose()
+                        density[1, u_out:u_out+w,v_out:v_out+w] += x_cpool_up[m-j,1,:,:].detach().cpu().numpy().transpose()
+
+            # Finished first pass through the chunk
+            t3 = timeit.default_timer()
+
+            # At this point we have a list of hits for this chunk
+            print("Chunk: (%6d,%6d) Hits: %4d Times: IO=%6.4f ResN=%6.4f WldC=%6.4f Totl=%8.4f" %
+                    (u,v,len(hits),t1-t0,t2-t1,t3-t2,t3-t0))
+
+        except:
+            worker.join(60)
+            traceback.print_exc()
+            sys.exit(-1)
 
     # Done with thread
     worker.join(60)

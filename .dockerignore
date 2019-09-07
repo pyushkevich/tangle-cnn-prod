@@ -1,0 +1,6 @@
+.*.sw?
+__pycache__
+.*~
+*~
+.git
+*.yaml
