@@ -52,7 +52,7 @@ def osl_worker(osl, u_range, v_range, window_size_raw, padding_size_raw):
             chunk_img=osl.read_region((xp,yp), 0, (wp,wp)).convert("RGB")
 
             # Place into queue
-            chunk_q.put(((x,y,w), (xp,yp,wp), chunk_img))
+            chunk_q.put(((u,v), (x,y,w), (xp,yp,wp), chunk_img))
 
     # Put a sentinel value
     chunk_q.put(None)
@@ -125,6 +125,9 @@ def do_apply(args):
     # Size of the training patch used to train wildcat, in raw pixels
     patch_size_raw = cf_scan.get('patch_size_raw', 512)
 
+    # Size to which these patches are downsampled
+    input_size_wildcat = cf_wildcat['input_size']
+
     # Size of the window used to apply WildCat. Should be larger than the patch size
     # This does not include the padding
     window_size_raw = cf_scan.get('window_size_raw', 4096)
@@ -175,21 +178,16 @@ def do_apply(args):
     print('Procesing region [%d %d] to [%d %d]' % (u_range[0], v_range[0], u_range[1], v_range[1]))
 
     # Set up a threaded worker to read openslide patches
-    worker = threading.Thread(target=osl_worker, args=(osl, u_range, v_range, chunk_width, overhang))
+    worker = threading.Thread(target=osl_worker, args=(osl, u_range, v_range, window_size_raw, padding_size_raw))
     worker.start()
 
     # Try/catch block to kill worker when done
+    t_00 = timeit.default_timer()
     try:
         
         # Range non-overlapping windows
         while True:
 
-            # Get the coordinates of the window in raw pixels
-            x,y,w = u*window_size_raw,v*window_size_raw,window_size_raw
-            
-            # Subtract the padding
-            xp,yp,wp = x-padding_size_raw,y-padding_size_raw,window_size_raw+2*padding_size_raw
-            
             # Read the chunk from the image
             t0 = timeit.default_timer()
             q_data = chunk_q.get()
@@ -200,7 +198,7 @@ def do_apply(args):
                 break
 
             # Get the values
-            ((x,y,w), (xp,yp,wp), chunk_img) = q_data
+            ((u,v), (x,y,w), (xp,yp,wp), chunk_img) = q_data
                     
             # Compute the desired size of input to wildcat
             wwc = int(wp * input_size_wildcat / patch_size_raw)

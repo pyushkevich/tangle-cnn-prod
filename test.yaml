@@ -22,3 +22,5 @@ spec:
     env:
       - name: GOOGLE_APPLICATION_CREDENTIALS
         value: /var/secrets/google/key.json
+  nodeSelector:
+    gpu: k80
