@@ -38,21 +38,21 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 chunk_q = queue.Queue(4)
 
 # Define the worker function to load chunks from the openslide image
-def osl_worker(osl, u_range, v_range, chunk_width, overhang):
-    for u in range(u_range[0], u_range[1], chunk_width):
-        for v in range(v_range[0], v_range[1], chunk_width):
+def osl_worker(osl, u_range, v_range, window_size_raw, padding_size_raw):
+    for u in range(u_range[0], u_range[1]):
+        for v in range(v_range[0], v_range[1]):
 
-            # Get the width of the region currently covered
-            win_dim = np.array((min(u_range[1] - u, chunk_width), min(v_range[1] - v, chunk_width)))
-
-            # Add the overhang - this is what will be read from the image
-            win_dim_ohang = win_dim + overhang
-
+            # Get the coordinates of the window in raw pixels
+            x,y,w = u*window_size_raw,v*window_size_raw,window_size_raw
+            
+            # Subtract the padding
+            xp,yp,wp = x-padding_size_raw,y-padding_size_raw,window_size_raw+2*padding_size_raw
+            
             # Read the chunk from the image
-            chunk_img=osl.read_region((u,v), 0, win_dim_ohang).convert("RGB")
+            chunk_img=osl.read_region((xp,yp), 0, (wp,wp)).convert("RGB")
 
             # Place into queue
-            chunk_q.put(((u,v), win_dim_ohang, chunk_img))
+            chunk_q.put(((x,y,w), (xp,yp,wp), chunk_img))
 
     # Put a sentinel value
     chunk_q.put(None)
@@ -109,6 +109,9 @@ def do_apply(args):
                 os.path.join(args.network, 'wildcat_upsample.dat'),
                 map_location=device))
 
+    # Read the parameters for scanning
+    cf_scan = config['scan']
+
     # Set evaluation mode
     model_wildcat.eval()
 
@@ -117,70 +120,77 @@ def do_apply(args):
 
     # Read the input using OpenSlide
     osl=openslide.OpenSlide(args.slide)
-
-    # The step by which the sampling window is slid (in raw pixels)
-    stride = config['stride']
-
-    # Window size in strides (e.g., 400 pixels)
-    window_size=config['window_size']
-
-    # Amount of overhang
-    overhang=(window_size-1)*stride
-
-    # Desired number of windows per chunk of SVS loaded into memory at once
-    chunk_size=config['chunk_size']
-
-    # Actual chunk size (without overhang)
-    chunk_width=stride * chunk_size
-
-    # Dimensions of the input image
     slide_dim = np.array(osl.dimensions)
 
-    # Factor by which wildcat shrinks input images when mapping to segmentations
-    wildcat_shrinkage=2
+    # Size of the training patch used to train wildcat, in raw pixels
+    patch_size_raw = cf_scan.get('patch_size_raw', 512)
 
-    # Scaling factor for output pixels, how many output pixels for every wildcat
-    # output pixel. This is needed because for stride of 100, there would be a 
-    # non-integer number of output pixels (14/4). 
-    out_scale = 0.5
+    # Size of the window used to apply WildCat. Should be larger than the patch size
+    # This does not include the padding
+    window_size_raw = cf_scan.get('window_size_raw', 4096)
+
+    # The amount of padding, relative to patch size to add to the window. This padding
+    # is to provide context at the edges of the window
+    padding_size_rel = cf_scan.get('padding_size_rel', 1.0)
+    padding_size_raw = int(padding_size_rel * patch_size_raw)
+
+    # Factor by which wildcat shrinks input images when mapping to segmentations
+    wildcat_shrinkage=cf_wildcat.get('shrinkage', 2)
+
+    # Additional shrinkage to apply to output (because we don't want to store very large)
+    # output images
+    extra_shrinkage=cf_scan.get('extra_shrinkage', 4)
 
     # Size of output pixel (in input pixels)
-    out_pix_size = wildcat_shrinkage * window_size * stride / (cf_wildcat['input_size'] * out_scale)
-    print('Output pixel size is %f times the input pixel size' % out_pix_size)
+    out_pix_size = wildcat_shrinkage * extra_shrinkage * patch_size_raw * 1.0 / input_size_wildcat
+
+    # The output size for each window
+    window_size_out = int(window_size_raw / out_pix_size)
+
+    # The padding size for the output
+    padding_size_out = int(padding_size_rel * patch_size_raw / out_pix_size)
+
+    # Total number of non-overlapping windows to process
+    n_win = np.ceil(slide_dim / window_size_raw).astype(int)
 
     # Output image size 
-    out_dim=(slide_dim/out_pix_size).astype(int)
-
-    # Padded output image size, to prevent issues at the border
-    out_dim_pad = out_dim + round(1 + stride / out_pix_size)
+    out_dim=(n_win * window_size_out).astype(int)
 
     # Output array (last dimension is per-class probabilities)
-    density=np.zeros((2, out_dim_pad[0], out_dim_pad[1]))
+    density=np.zeros((2, out_dim[0], out_dim[1]))
 
     # Range of pixels to scan
-    u_range,v_range = (0,slide_dim[0]),(0,slide_dim[1])
+    u_range,v_range = (0,n_win[0]),(0,n_win[1])
+
+    # Allow a custom region to be specified
     if args.region is not None and len(args.region) == 4:
         R=list(float(val) for val in args.region)
         if all(val < 1.0 for val in R):
-            u_range=(int(R[0]*slide_dim[0]),int((R[0]+R[2])*slide_dim[0]))
-            v_range=(int(R[1]*slide_dim[1]),int((R[1]+R[3])*slide_dim[1]))
+            u_range=(int(R[0]*n_win[0]),int((R[0]+R[2])*n_win[0]))
+            v_range=(int(R[1]*n_win[1]),int((R[1]+R[3])*n_win[1]))
         else:
             u_range=(int(R[0]), int(R[0]+R[2]))
             v_range=(int(R[1]), int(R[1]+R[3]))
 
     print('Procesing region [%d %d] to [%d %d]' % (u_range[0], v_range[0], u_range[1], v_range[1]))
 
-    # Set up a threaded worker to read openslide pieces
+    # Set up a threaded worker to read openslide patches
     worker = threading.Thread(target=osl_worker, args=(osl, u_range, v_range, chunk_width, overhang))
     worker.start()
 
-    # Read stuff from queue
-    while True:
+    # Try/catch block to kill worker when done
+    try:
+        
+        # Range non-overlapping windows
+        while True:
 
-        # Try/catch block should terminate program
-        try:
-
-            # Read a tuple from the queue
+            # Get the coordinates of the window in raw pixels
+            x,y,w = u*window_size_raw,v*window_size_raw,window_size_raw
+            
+            # Subtract the padding
+            xp,yp,wp = x-padding_size_raw,y-padding_size_raw,window_size_raw+2*padding_size_raw
+            
+            # Read the chunk from the image
             t0 = timeit.default_timer()
             q_data = chunk_q.get()
             t1 = timeit.default_timer()
@@ -189,114 +199,65 @@ def do_apply(args):
             if q_data is None:
                 break
 
-            # Get the offset of the read image, etc
-            (u, v) = q_data[0]
-            win_dim_ohang = q_data[1]
-
-            # Get the read image
-            chunk_img = q_data[2]
+            # Get the values
+            ((x,y,w), (xp,yp,wp), chunk_img) = q_data
+                    
+            # Compute the desired size of input to wildcat
+            wwc = int(wp * input_size_wildcat / patch_size_raw)
 
             # Resample the chunk for the two networks
-            win_dim_ohang_resnet = win_dim_ohang * cf_resnet['input_size'] / (stride * window_size)        
-            tran_resnet = transforms.Compose([
-                transforms.Resize(int(min(win_dim_ohang_resnet))),
+            tran = transforms.Compose([
+                transforms.Resize((wwc,wwc)),
                 transforms.ToTensor(),
                 transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-                ])
-
-            # Stride width for resnet (1/4 of 224)
-            stride_t = int(cf_resnet['input_size'] / window_size)
-
+            ])
+            
             # Convert the read chunk to tensor format
-            chunk_tensor=tran_resnet(chunk_img).to(device)
-            chunk_ufold=chunk_tensor.unfold(1,cf_resnet['input_size'],stride_t).unfold(2,cf_resnet['input_size'],stride_t).permute((1,2,0,3,4))
+            with torch.no_grad():
+                
+                # Apply transforms and turn into correct-size torch tensor
+                chunk_tensor=torch.unsqueeze(tran(chunk_img),dim=0).to(device)
+                
+                # Forward pass through the wildcat model
+                x_clas = model_wildcat.forward_to_classifier(chunk_tensor)
+                x_cpool = model_wildcat.spatial_pooling.class_wise(x_clas)
 
-            # Create array of windows that are hits
-            hits=[]
+                # Scale the cpool image to desired size
+                x_cpool_up = torch.nn.functional.interpolate(x_cpool, scale_factor=1.0/extra_shrinkage).detach().cpu().numpy()
 
-            # Iterate over windows
-            for i in range(0, chunk_ufold.shape[1]):
-                for k in range(0, chunk_ufold.shape[0], args.bsr):
-
-                    # Process the batch
-                    k_range = range(k,min(k+args.bsr, chunk_ufold.shape[0]))
-                    y_ik = model_resnet(chunk_ufold[k_range,i,:,:,:]).cpu().detach().numpy()
-
-                    # Record all the hits in this batch
-                    for j in k_range:
-                        if np.argmax(y_ik[j-k,:]) > 0:
-                            hits.append([i, j])
-
+                # Extract the central portion of the output
+                p0,p1 = padding_size_out,(padding_size_out+window_size_out)
+                x_cpool_ctr = x_cpool_up[:,:,p0:p1,p0:p1]
+                
+                # Stick it into the output array
+                xout0,xout1 = u * window_size_out, ((u+1) * window_size_out)
+                yout0,yout1 = v * window_size_out, ((v+1) * window_size_out)
+                density[0,xout0:xout1,yout0:yout1] = x_cpool_ctr[0,0,:,:].transpose()
+                density[1,xout0:xout1,yout0:yout1] = x_cpool_ctr[0,1,:,:].transpose()
+                    
             # Finished first pass through the chunk
             t2 = timeit.default_timer()
-
-            # If there are hits, perform wildcat refinement
-            if len(hits) > 0:
-
-                # Resample the chunk for the wildcat network
-                win_dim_ohang_wildcat = win_dim_ohang * cf_wildcat['input_size'] / (stride * window_size)        
-                tran_wildcat = transforms.Compose([
-                    transforms.Resize(int(min(win_dim_ohang_wildcat))),
-                    transforms.ToTensor(),
-                    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-                    ])
-
-                # Stride width for resnet (1/4 of 448)
-                stride_t_wildcat = int(cf_wildcat['input_size'] / window_size)
-
-                # Convert the read chunk to tensor format and unfold
-                chunk_tensor_wildcat=tran_wildcat(chunk_img).to(device)
-                chunk_ufold_wildcat=chunk_tensor_wildcat.unfold(
-                        1,cf_wildcat['input_size'],stride_t_wildcat).unfold(
-                                2,cf_wildcat['input_size'],stride_t_wildcat).permute((1,2,0,3,4))
-
-                # Stack the tensors
-                hit_folds=[]
-                for h in hits:
-                    hit_folds.append(chunk_ufold_wildcat[h[1],h[0],:,:,:])
-
-                hit_sausage=torch.stack(hit_folds)
-
-                # Process by batches
-                for j in range(0, len(hits), args.bsw):
-                    j_end = min(j+args.bsw, len(hits))
-
-                    # Forward pass through the wildcat model
-                    # x_feat = model_wildcat.features(hit_sausage[j:j_end,:,:,:])
-                    x_clas = model_wildcat.forward_to_classifier(hit_sausage[j:j_end,:,:,:])
-                    x_cpool = model_wildcat.spatial_pooling.class_wise(x_clas)
-
-                    # Scale the cpool image
-                    x_cpool_up = torch.nn.functional.interpolate(x_cpool, scale_factor=out_scale)
-                    w = x_cpool_up.shape[3]
-
-                    # Output index for the current hit
-                    for m in range (j, j_end):
-                        u_out = round((u + stride * hits[m][0]) / out_pix_size)
-                        v_out = round((v + stride * hits[m][1]) / out_pix_size)
-                        try:
-                            density[0, u_out:u_out+w,v_out:v_out+w] += x_cpool_up[m-j,0,:,:].detach().cpu().numpy().transpose()
-                            density[1, u_out:u_out+w,v_out:v_out+w] += x_cpool_up[m-j,1,:,:].detach().cpu().numpy().transpose()
-                        except ValueError:
-                            print('ValueError raised')
-                            traceback.print_exc()
-
-            # Finished first pass through the chunk
-            t3 = timeit.default_timer()
-
+            
             # At this point we have a list of hits for this chunk
-            print("Chunk: (%6d,%6d) Hits: %4d Times: IO=%6.4f ResN=%6.4f WldC=%6.4f Totl=%8.4f" %
-                    (u,v,len(hits),t1-t0,t2-t1,t3-t2,t3-t0))
+            print("Chunk: (%6d,%6d) Times: IO=%6.4f WldC=%6.4f Totl=%8.4f" %
+                  (u,v,t1-t0,t2-t1,t2-t0))
+            
+        # Trim the density array to match size of input
+        out_dim_trim=np.round((slide_dim/out_pix_size)).astype(int)
+        density=density[:,0:out_dim_trim[0],0:out_dim_trim[1]]
 
-        except:
-            worker.join(60)
-            traceback.print_exc()
-            sys.exit(-1)
+        # Report total time
+        t_11 = timeit.default_timer()
+        print("Total time elapsed: %8.4f" % (t_11-t_00,))
 
-    # Done with thread
-    worker.join(60)
-    if worker.isAlive():
-        print('Thread worker failed to terminate after 60 seconds')
+    except:
+        traceback.print_exc()
+        sys.exit(-1)
+
+    finally:
+        worker.join(60)
+        if worker.isAlive():
+            print('Thread worker failed to terminate after 60 seconds')
 
     # Set the spacing based on openslide
     # Get the image spacing from the header, in mm units
@@ -318,14 +279,10 @@ def do_apply(args):
     # Report spacing information
     print("Spacing of the mri-like image: %gx%gmm\n" % (sx, sy))
 
-    # Trim the output array to actual size
-    density = density[0:out_dim[0], 0:out_dim[1]]
-
     # Write the result as a NIFTI file
     nii = sitk.GetImageFromArray(np.transpose(density, (2,1,0)), True)
     nii.SetSpacing((sx, sy))
     sitk.WriteImage(nii, args.output)
-
 
 
 # Set up an argument parser
