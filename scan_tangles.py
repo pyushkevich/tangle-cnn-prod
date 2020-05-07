@@ -7,7 +7,6 @@ import torch.optim as optim
 import numpy as np
 import torchvision
 from torchvision import datasets, models, transforms
-import matplotlib.pyplot as plt
 import time
 import os
 import copy
@@ -20,9 +19,10 @@ import argparse
 import json
 import SimpleITK as sitk
 import threading
-import queue
 import parse
 import traceback
+
+from osl_worker import osl_worker, osl_read_chunk_from_queue
 
 # Import wildcat models
 sys.path.append("wildcat.pytorch")
@@ -33,30 +33,6 @@ from unet_wildcat import *
 
 # Set up the device (CPU/GPU)
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
-# Set up a queue for image chunks
-chunk_q = queue.Queue(4)
-
-# Define the worker function to load chunks from the openslide image
-def osl_worker(osl, u_range, v_range, window_size_raw, padding_size_raw):
-    for u in range(u_range[0], u_range[1]):
-        for v in range(v_range[0], v_range[1]):
-
-            # Get the coordinates of the window in raw pixels
-            x,y,w = u*window_size_raw,v*window_size_raw,window_size_raw
-            
-            # Subtract the padding
-            xp,yp,wp = x-padding_size_raw,y-padding_size_raw,window_size_raw+2*padding_size_raw
-            
-            # Read the chunk from the image
-            chunk_img=osl.read_region((xp,yp), 0, (wp,wp)).convert("RGB")
-
-            # Place into queue
-            chunk_q.put(((u,v), (x,y,w), (xp,yp,wp), chunk_img))
-
-    # Put a sentinel value
-    chunk_q.put(None)
-
 
 def do_info(args):
     print("PyTorch Version: ",torch.__version__)
@@ -84,7 +60,7 @@ def do_apply(args):
     elif cf_resnet['size'] == 18:
         model_resnet = models.resnet18(pretrained=False)
     else:
-        raise 'Incompatible resnet model size'
+        raise Exception('Incompatible resnet model size')
 
     # Load the resnet model
     model_resnet.fc = nn.Linear(model_resnet.fc.in_features, cf_resnet['num_classes'])
@@ -190,7 +166,7 @@ def do_apply(args):
 
             # Read the chunk from the image
             t0 = timeit.default_timer()
-            q_data = chunk_q.get()
+            q_data = osl_read_chunk_from_queue()
             t1 = timeit.default_timer()
 
             # Check for sentinel value
