@@ -11,7 +11,7 @@ gcloud config set project $project_id
 
 # Download the SVS
 mkdir -p ./data ./model
-if ! gsutil cp "gs://mtl_histology/$id/histo_raw/${svs}.*" ./data/; then
+if ! gsutil -m cp "gs://mtl_histology/$id/histo_raw/${svs}.*" ./data/; then
   echo "Download of SVS file failed for $id $svs"
   exit 255
 fi
@@ -35,7 +35,7 @@ fi
 
 # Form the model URL
 MODEL_URL="gs://svsbucket/cnn_models/nissl/deepcluster.alexnet.tar"
-if ! gsutil cp "${MODEL_URL}/*" ./model/; then
+if ! gsutil -m cp "${MODEL_URL}" ./model/; then
   echo "Download failed for $MODEL_URL"
   exit 255
 fi
@@ -43,7 +43,7 @@ fi
 # Run the code
 python -u nissl_to_multichannel.py apply \
   --slide $svslocal \
-  --output ./data/result.nii.gz \
+  --output ./data/result.nii.gz --window 8192 \
   --network ./model/deepcluster.alexnet.tar
 
 # Copy result up to storage
