@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: my-gpu-pod-torch
+spec:
+  volumes:
+    - name: google-cloud-key
+      secret:
+        secretName: gse-key
+  containers:
+  - name: my-gpu-container-torch
+    image: pyushkevich/tangle-cnn-prod:latest
+    command: ["train_full.sh"]
+    args: ["cfn-cluster-test", "fold_HNL-29-18", "model_fold_HNL-29-18_wcu_50_30epoch"]
+    resources:
+      limits:
+        nvidia.com/gpu: 1
+        memory: "8Gi"
+    volumeMounts:
+      - name: google-cloud-key
+        mountPath: /var/secrets/google
+    env:
+      - name: GOOGLE_APPLICATION_CREDENTIALS
+        value: /var/secrets/google/key.json
