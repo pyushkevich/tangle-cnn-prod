@@ -1,7 +1,6 @@
 # Set up
 import os
 import sys
-from deepcluster.util import load_model
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.utils
@@ -15,6 +14,10 @@ import parse
 import SimpleITK as sitk
 import threading
 from osl_worker import osl_worker, osl_read_chunk_from_queue
+
+# Deepcluster
+sys.path.append("deepcluster")
+from deepcluster.util import load_model
 
 
 def run_model_on_window(model, W):
@@ -46,7 +49,7 @@ def apply_to_slide(args):
     (w, h) = osl.level_dimensions[0]
 
     # Size of the input window and number of windows
-    window_size = args.window
+    window_size = int(args.window)
     nw_x, nw_y = math.ceil(w / window_size), math.ceil(h / window_size)
 
     # Output window size and output dimensions
