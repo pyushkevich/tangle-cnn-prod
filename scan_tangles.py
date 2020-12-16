@@ -1,4 +1,4 @@
-#!/bin/python
+#!/usr/bin/env python
 from __future__ import print_function
 from __future__ import division
 import torch
@@ -327,9 +327,9 @@ def train_model(model, dataloaders, criterion, optimizer, num_epochs=25):
                 best_acc = epoch_acc
                 best_model_wts = copy.deepcopy(model.state_dict())
             if phase == 'val':
-                val_acc_history.append(epoch_acc)
+                val_acc_history.append(epoch_acc.item())
             elif phase == 'train':
-                train_acc_history.append(epoch_acc)
+                train_acc_history.append(epoch_acc.item())
 
         print()
 
@@ -354,7 +354,7 @@ def do_train(arg):
             "kmax": float(arg.kmax),
             "kmin": float(arg.kmin),
             "alpha": float(arg.alpha),
-            "num_maps": int(arg.num_maps),
+            "num_maps": int(arg.nmaps),
             "input_size": 224,
             "num_epochs": int(arg.epochs),
             "batch_size": int(arg.batch)
@@ -388,11 +388,15 @@ def do_train(arg):
 
     # Create image datasets
     data_transforms = {k: transforms.Compose(v) for k,v in data_transform_lists.items()}
-    image_datasets = {k: datasets.ImageFolder(os.path.join(data_dir, k), v) for k,v in data_transforms}
+    image_datasets = {k: datasets.ImageFolder(os.path.join(data_dir, k), v) for k,v in data_transforms.items()}
 
     # Get the class name to index mapping
     config['class_to_idx'] = image_datasets['train'].class_to_idx
     config['num_classes'] = len(image_datasets['train'].class_to_idx)
+
+    # Print the config
+    print("Training configuration:")
+    print(config)
 
     # Instantiate WildCat model
     model = resnet50_wildcat_upsample(
@@ -447,6 +451,7 @@ def do_train(arg):
     }
 
     # Save the configuration
+    print(config)
     with open(os.path.join(model_dir, 'config.json'), 'w') as jfile:
         json.dump(config, jfile)
 
@@ -601,4 +606,5 @@ info_parser.set_defaults(func=do_info)
 
 if __name__ == '__main__':
     args = parser.parse_args()
+    print(args)
     args.func(args)
