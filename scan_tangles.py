@@ -45,78 +45,55 @@ def read_openslide_chunk(osl, pos, level, size):
 # Function to apply training to a slide
 def do_apply(args):
 
-    # Read the .json config file
-    with open(os.path.join(args.network, 'config.json')) as json_file:
+    # Set the model directory
+    model_dir = args.modeldir
+
+    # Read the model's .json config file
+    with open(os.path.join(model_dir, 'config.json')) as json_file:
         config=json.load(json_file)
 
-    # Read the resnet portion of the config
-    cf_resnet = config['resnet']
+    # Create the model
+    model_ft = resnet50_wildcat_upsample(
+        config['num_classes'],
+        pretrained=True,
+        kmax=config['wildcat_upsample']['kmax'],
+        kmin=config['wildcat_upsample']['kmin'],
+        alpha=config['wildcat_upsample']['alpha'],
+        num_maps=config['wildcat_upsample']['num_maps'])
 
-    # Create the resnet model
-    if cf_resnet['size'] == 50:
-        model_resnet = models.resnet50(pretrained=False)
-    elif cf_resnet['size'] == 18:
-        model_resnet = models.resnet18(pretrained=False)
-    else:
-        raise Exception('Incompatible resnet model size')
-
-    # Load the resnet model
-    model_resnet.fc = nn.Linear(model_resnet.fc.in_features, cf_resnet['num_classes'])
-    model_resnet.load_state_dict(torch.load(
-        os.path.join(args.network, 'resnet.dat'),
-        map_location=device))
-    model_resnet.eval()
-    model_resnet = model_resnet.to(device)
-
-    # Read the wildcat portion of the config
-    cf_wildcat = config['wildcat_upsample']
-
-    # Read the wildcat model
-    model_wildcat = resnet50_wildcat_upsample(
-            2, pretrained=False, 
-            kmax=cf_wildcat['kmax'],
-            alpha=cf_wildcat['alpha'],
-            num_maps=cf_wildcat['num_maps'])
-
-    model_wildcat.load_state_dict(
-            torch.load(
-                os.path.join(args.network, 'wildcat_upsample.dat'),
-                map_location=device))
-
-    # Read the parameters for scanning
-    cf_scan = config['scan']
-
-    # Set evaluation mode
-    model_wildcat.eval()
+    # Read model state
+    model_ft.load_state_dict(
+        torch.load(os.path.join(model_dir, "wildcat_upsample.dat")))
 
     # Send model to GPU
-    model_wildcat = model_wildcat.to(device)
+    model_ft.eval()
+    model_ft = model_ft.to(device)
 
     # Read the input using OpenSlide
     osl=openslide.OpenSlide(args.slide)
     slide_dim = np.array(osl.dimensions)
 
-    # Size of the training patch used to train wildcat, in raw pixels
-    patch_size_raw = cf_scan.get('patch_size_raw', 512)
+    # Input size to WildCat (should be 224)
+    input_size_wildcat = config['wildcat_upsample']['input_size']
 
-    # Size to which these patches are downsampled
-    input_size_wildcat = cf_wildcat['input_size']
+    # Corresponding patch size in raw image (should match WildCat, no downsampling)
+    patch_size_raw = config['wildcat_upsample']['input_size']
 
     # Size of the window used to apply WildCat. Should be larger than the patch size
     # This does not include the padding
-    window_size_raw = cf_scan.get('window_size_raw', 4096)
+    window_size_raw = int(args.window)
 
     # The amount of padding, relative to patch size to add to the window. This padding
     # is to provide context at the edges of the window
-    padding_size_rel = cf_scan.get('padding_size_rel', 1.0)
+    padding_size_rel = 1.0
     padding_size_raw = int(padding_size_rel * patch_size_raw)
 
     # Factor by which wildcat shrinks input images when mapping to segmentations
-    wildcat_shrinkage=cf_wildcat.get('shrinkage', 2)
+    wildcat_shrinkage=2
 
     # Additional shrinkage to apply to output (because we don't want to store very large)
     # output images
-    extra_shrinkage=cf_scan.get('extra_shrinkage', 4)
+    extra_shrinkage=int(args.shrink)
 
     # Size of output pixel (in input pixels)
     out_pix_size = wildcat_shrinkage * extra_shrinkage * patch_size_raw * 1.0 / input_size_wildcat
@@ -134,20 +111,21 @@ def do_apply(args):
     out_dim=(n_win * window_size_out).astype(int)
 
     # Output array (last dimension is per-class probabilities)
-    density=np.zeros((2, out_dim[0], out_dim[1]))
+    num_classes = config['num_classes']
+    density=np.zeros((num_classes, out_dim[0], out_dim[1]))
 
     # Range of pixels to scan
     u_range,v_range = (0,n_win[0]),(0,n_win[1])
 
     # Allow a custom region to be specified
     if args.region is not None and len(args.region) == 4:
-        R=list(float(val) for val in args.region)
-        if all(val < 1.0 for val in R):
-            u_range=(int(R[0]*n_win[0]),int((R[0]+R[2])*n_win[0]))
-            v_range=(int(R[1]*n_win[1]),int((R[1]+R[3])*n_win[1]))
+        region=list(float(val) for val in args.region)
+        if all(val < 1.0 for val in region):
+            u_range=(int(region[0]*n_win[0]),int((region[0]+region[2])*n_win[0]))
+            v_range=(int(region[1]*n_win[1]),int((region[1]+region[3])*n_win[1]))
         else:
-            u_range=(int(R[0]), int(R[0]+R[2]))
-            v_range=(int(R[1]), int(R[1]+R[3]))
+            u_range=(int(region[0]), int(region[0]+region[2]))
+            v_range=(int(region[1]), int(region[1]+region[3]))
 
     print('Procesing region [%d %d] to [%d %d]' % (u_range[0], v_range[0], u_range[1], v_range[1]))
 
@@ -191,8 +169,8 @@ def do_apply(args):
                 chunk_tensor=torch.unsqueeze(tran(chunk_img),dim=0).to(device)
                 
                 # Forward pass through the wildcat model
-                x_clas = model_wildcat.forward_to_classifier(chunk_tensor)
-                x_cpool = model_wildcat.spatial_pooling.class_wise(x_clas)
+                x_clas = model_ft.forward_to_classifier(chunk_tensor)
+                x_cpool = model_ft.spatial_pooling.class_wise(x_clas)
 
                 # Scale the cpool image to desired size
                 x_cpool_up = torch.nn.functional.interpolate(x_cpool, scale_factor=1.0/extra_shrinkage).detach().cpu().numpy()
@@ -204,9 +182,9 @@ def do_apply(args):
                 # Stick it into the output array
                 xout0,xout1 = u * window_size_out, ((u+1) * window_size_out)
                 yout0,yout1 = v * window_size_out, ((v+1) * window_size_out)
-                density[0,xout0:xout1,yout0:yout1] = x_cpool_ctr[0,0,:,:].transpose()
-                density[1,xout0:xout1,yout0:yout1] = x_cpool_ctr[0,1,:,:].transpose()
-                    
+                for j in range(num_classes):
+                    density[j,xout0:xout1,yout0:yout1] = x_cpool_ctr[0,j,:,:].transpose()
+
             # Finished first pass through the chunk
             t2 = timeit.default_timer()
             
@@ -629,10 +607,11 @@ val_parser.set_defaults(func=do_val)
 
 apply_parser = subparsers.add_parser('apply')
 apply_parser.add_argument('--slide', help='Input histology slide to process')
+apply_parser.add_argument('--modeldir', help='Directory containing the model')
 apply_parser.add_argument('--output', help='Where to store the output density map')
-apply_parser.add_argument('--network', help='Network saved during training')
-apply_parser.add_argument('--bs', help='Batch size for WildCat', default=16)
 apply_parser.add_argument('--region', help='Region of image to process (x,y,w,h)', nargs=4)
+apply_parser.add_argument('--window', help='Size of the window for scanning', default=4096)
+apply_parser.add_argument('--shrink', help='How much to downsample WildCat output', default=4)
 apply_parser.set_defaults(func=do_apply)
 
 info_parser = subparsers.add_parser('info')
