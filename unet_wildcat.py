@@ -3,7 +3,7 @@ import torch.nn as nn
 import torchvision.models as models
 import torch.nn.functional as F
 
-from wildcat.pooling import WildcatPool2d, ClassWisePool
+from wildcat_pytorch.wildcat.pooling import WildcatPool2d, ClassWisePool
 
 class double_conv(nn.Module):
     '''(conv => BN => ReLU) * 2'''
