@@ -384,6 +384,7 @@ def do_train(arg):
 
     # Add the optional erasing transform
     if bool(arg.erasing):
+        print('Adding erasing transform')
         data_transform_lists['train'].append(transforms.RandomErasing())
 
     # Create image datasets
@@ -639,5 +640,4 @@ info_parser.set_defaults(func=do_info)
 
 if __name__ == '__main__':
     args = parser.parse_args()
-    print(args)
     args.func(args)
