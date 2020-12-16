@@ -21,24 +21,21 @@ import SimpleITK as sitk
 import threading
 import parse
 import traceback
-
-from osl_worker import osl_worker, osl_read_chunk_from_queue
-
-# Import wildcat models
-sys.path.append("wildcat.pytorch")
-import wildcat.models
-
-# Import wildcat mods
 from unet_wildcat import *
+from osl_worker import osl_worker, osl_read_chunk_from_queue
+import wildcat_pytorch.wildcat as wildcat
+
 
 # Set up the device (CPU/GPU)
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-def do_info(args):
+
+def do_info(dummy_args):
     print("PyTorch Version: ",torch.__version__)
     print("Torchvision Version: ",torchvision.__version__)
     print("CUDA status: ", torch.cuda.is_available())
     print("CUDA memory max alloc: %8.f MB" % (torch.cuda.max_memory_allocated() / 2.0**20))
+
 
 def read_openslide_chunk(osl, pos, level, size):
     chunk_img=osl.read_region(pos, level, size).convert("RGB")
@@ -259,27 +256,29 @@ def do_apply(args):
     sitk.WriteImage(nii, args.output)
 
 
-
 # Standard training code
 def train_model(model, dataloaders, criterion, optimizer, num_epochs=25):
     since = time.time()
 
+    train_acc_history = []
     val_acc_history = []
 
     best_model_wts = copy.deepcopy(model.state_dict())
     best_acc = 0.0
 
+    # Number of classes
+    num_classes = len(dataloaders['train'].dataset.class_to_idx)
+
     for epoch in range(num_epochs):
         print('Epoch {}/{}'.format(epoch, num_epochs - 1))
         print('-' * 10)
-        estart = time.time()
 
         # Each epoch has a training and validation phase
         for phase in ['train', 'val']:
             if phase == 'train':
                 model.train()  # Set model to training mode
             else:
-                model.eval()   # Set model to evaluate mode
+                model.eval()  # Set model to evaluate mode
 
             running_loss = 0.0
             running_corrects = 0
@@ -288,9 +287,9 @@ def train_model(model, dataloaders, criterion, optimizer, num_epochs=25):
             for inputs, labels in dataloaders[phase]:
                 inputs = inputs.to(device)
                 labels = labels.to(device)
-                labels_one_hot = torch.zeros([labels.shape[0], 2])
-                labels_one_hot[:,0] = (labels==0)
-                labels_one_hot[:,1] = (labels==1)
+                labels_one_hot = torch.zeros([labels.shape[0], num_classes])
+                for i in range(num_classes):
+                    labels_one_hot[:, i] = (labels == i)
                 labels_one_hot = labels_one_hot.to(device)
 
                 # zero the parameter gradients
@@ -320,7 +319,7 @@ def train_model(model, dataloaders, criterion, optimizer, num_epochs=25):
             epoch_loss = running_loss / len(dataloaders[phase].dataset)
             epoch_acc = running_corrects.double() / len(dataloaders[phase].dataset)
 
-            print('{} Loss: {:.4f} Acc: {:.4f} Time: {:8.4f}'.format(phase, epoch_loss, epoch_acc, (time.time()-estart)))
+            print('{} Loss: {:.4f} Acc: {:.4f}'.format(phase, epoch_loss, epoch_acc))
 
             # deep copy the model
             if phase == 'val' and epoch_acc > best_acc:
@@ -328,6 +327,8 @@ def train_model(model, dataloaders, criterion, optimizer, num_epochs=25):
                 best_model_wts = copy.deepcopy(model.state_dict())
             if phase == 'val':
                 val_acc_history.append(epoch_acc)
+            elif phase == 'train':
+                train_acc_history.append(epoch_acc)
 
         print()
 
@@ -337,63 +338,116 @@ def train_model(model, dataloaders, criterion, optimizer, num_epochs=25):
 
     # load best model weights
     model.load_state_dict(best_model_wts)
-    return model, val_acc_history
+    return model, val_acc_history, train_acc_history
 
 
-def do_train(args):
+def do_train(arg):
+    global device
 
-    # Number of classes in the dataset
-    num_classes = 2
+    # Read the experiment directory
+    exp_dir = arg.expdir
 
-    # Batch size for training (change depending on how much memory you have)
-    batch_size = int(args.batch)
-    num_epochs = int(args.epochs)
+    # Set up the configuration
+    config = {
+        "wildcat_upsample": {
+            "kmax": float(arg.kmax),
+            "kmin": float(arg.kmin),
+            "alpha": float(arg.alpha),
+            "num_maps": int(arg.num_maps),
+            "input_size": 224,
+            "num_epochs": int(arg.epochs),
+            "batch_size": int(arg.batch)
+        }
+    }
 
-    # Input image size
-    input_size = 224
+    # Transforms for training and validation
+    input_size = config['wildcat_upsample']['input_size']
+    data_dir = os.path.join(exp_dir, "patches")
 
-    # Initialize the wildcat model
-    model=resnet50_wildcat_upsample(2, pretrained=True, kmax=0.02, kmin=0.0, alpha=0.7, num_maps=4)
+    # Create a list of transforms to compose
+    data_transform_lists = {
+        'train': [
+            transforms.RandomRotation(45),
+            transforms.RandomVerticalFlip(),
+            transforms.RandomHorizontalFlip(),
+            transforms.CenterCrop(input_size),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ],
+        'val': [
+            transforms.CenterCrop(input_size),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ]
+    }
+
+    # Add the optional erasing transform
+    if bool(arg.erasing):
+        data_transform_lists['train'].append(transforms.RandomErasing())
+
+    # Create image datasets
+    data_transforms = {k: transforms.Compose(v) for k,v in data_transform_lists.items()}
+    image_datasets = {k: datasets.ImageFolder(os.path.join(data_dir, k), v) for k,v in data_transforms}
+
+    # Get the class name to index mapping
+    config['class_to_idx'] = image_datasets['train'].class_to_idx
+    config['num_classes'] = len(image_datasets['train'].class_to_idx)
+
+    # Instantiate WildCat model
+    model = resnet50_wildcat_upsample(
+        config['num_classes'],
+        pretrained=True,
+        kmax=config['wildcat_upsample']['kmax'],
+        kmin=config['wildcat_upsample']['kmin'],
+        alpha=config['wildcat_upsample']['alpha'],
+        num_maps=config['wildcat_upsample']['num_maps'])
+
+    # Generate a weighted sampler
+    class_counts = np.array(list(map(lambda x: image_datasets['train'].targets.count(x), range(config['num_classes']))))
+    sample_weights = torch.DoubleTensor([1. / class_counts[i] for i in image_datasets['train'].targets])
+    weighted_sampler = torch.utils.data.sampler.WeightedRandomSampler(sample_weights, len(sample_weights),
+                                                                      replacement=True)
 
     # Loss and optimizer
     criterion = nn.MultiLabelSoftMarginLoss()
-    optimizer = torch.optim.SGD(model.get_config_optim(0.01, 0.1), lr=0.01, momentum=0.9, weight_decay=1e-4)
+    optimizer = torch.optim.SGD(model.get_config_optim(0.01, 0.1), lr=0.01, momentum=0.9, weight_decay=1e-2)
 
-    # Transforms for training and validation
-    data_transforms = {
-            'train': transforms.Compose([
-                transforms.RandomResizedCrop(input_size),
-                transforms.RandomRotation(45),
-                transforms.RandomVerticalFlip(),
-                transforms.RandomHorizontalFlip(),
-                transforms.ToTensor(),
-                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-                ]),
-            'val': transforms.Compose([
-                transforms.Resize(input_size),
-                transforms.CenterCrop(input_size),
-                transforms.ToTensor(),
-                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-                ]),
-            }
+    # Training and validation data loaders
+    dataloaders_dict = {
+        'train': torch.utils.data.DataLoader(image_datasets['train'],
+                                             batch_size=config['wildcat_upsample']['batch_size'],
+                                             sampler=weighted_sampler,
+                                             num_workers=4),
+        'val': torch.utils.data.DataLoader(image_datasets['val'],
+                                           batch_size=config['wildcat_upsample']['batch_size'],
+                                           shuffle=True,
+                                           num_workers=4),
+    }
 
-    # Training and validation dataloaders
-    image_datasets = {x: datasets.ImageFolder(os.path.join(args.datadir, x), data_transforms[x]) for x in ['train', 'val']}
-    dataloaders_dict = {x: torch.utils.data.DataLoader(image_datasets[x], batch_size=batch_size, shuffle=True, num_workers=4) for x in ['train', 'val']}
-
-    # Map to CUDA
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    print("Device: ", device)
-
+    # Map stuff to the device
     model = model.to(device)
     criterion = criterion.to(device)
 
     # Run the training
-    model_ft, hist = train_model(model, dataloaders_dict, criterion, optimizer, num_epochs=num_epochs)
+    model_ft, hist_val, hist_train = \
+        train_model(model, dataloaders_dict, criterion, optimizer, num_epochs=config['wildcat_upsample']['num_epochs'])
 
-    # After the training, save the model
-    torch.save(model_ft.state_dict(), args.output)
+    # Save the model using a format that can be read using production-time scripts
+    model_dir = os.path.join(exp_dir, "models")
+    os.makedirs(model_dir, exist_ok=True)
 
+    # Save the model
+    torch.save(model_ft.state_dict(), os.path.join(model_dir, "wildcat_upsample.dat"))
+
+    # Add training history to saved config
+    config['train_history'] = {
+        'train': hist_train,
+        'val': hist_val
+    }
+
+    # Save the configuration
+    with open(os.path.join(model_dir, 'config.json'), 'w') as jfile:
+        json.dump(config, jfile)
 
 
 # Set up an argument parser
@@ -401,19 +455,21 @@ parser = argparse.ArgumentParser()
 subparsers = parser.add_subparsers()
 
 train_parser = subparsers.add_parser('train')
-train_parser.add_argument('--datadir', help='source directory')
-train_parser.add_argument('--output', help='output classifier')
-train_parser.add_argument('--epochs', help='number of epochs')
-train_parser.add_argument('--batch', help='batch size')
+train_parser.add_argument('--expdir', help='experiment directory')
+train_parser.add_argument('--epochs', help='number of epochs', default=50)
+train_parser.add_argument('--batch', help='batch size', default=16)
+train_parser.add_argument('--kmax', help='WildCat k_max parameter', default=0.02)
+train_parser.add_argument('--kmin', help='WildCat k_min parameter', default=0.0)
+train_parser.add_argument('--alpha', help='WildCat alpha parameter', default=0.7)
+train_parser.add_argument('--nmaps', help='WildCat number of maps parameter', default=4)
+train_parser.add_argument('--erasing', help='Whether to perform erasing augmentation', default=False)
 train_parser.set_defaults(func=do_train)
-
 
 apply_parser = subparsers.add_parser('apply')
 apply_parser.add_argument('--slide', help='Input histology slide to process')
 apply_parser.add_argument('--output', help='Where to store the output density map')
 apply_parser.add_argument('--network', help='Network saved during training')
-apply_parser.add_argument('--bsr', help='Batch size for ResNet', default=8)
-apply_parser.add_argument('--bsw', help='Batch size for WildCat', default=8)
+apply_parser.add_argument('--bs', help='Batch size for WildCat', default=16)
 apply_parser.add_argument('--region', help='Region of image to process (x,y,w,h)', nargs=4)
 apply_parser.set_defaults(func=do_apply)
 
