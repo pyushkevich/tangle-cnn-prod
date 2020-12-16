@@ -566,15 +566,45 @@ def do_val(arg):
     # Generate true and false positives
     for j in range(num_classes):
         plot_error(img_fp, j, 'positives', class_names, cm)
-        plt.savefig(os.path.join(report_dir, "false_positives_%s" % (class_names[j],)))
+        plt.savefig(os.path.join(report_dir, "false_positives_%s.png" % (class_names[j],)))
 
     for j in range(num_classes):
         plot_error(img_fn, j, 'negatives', class_names, cm)
-        plt.savefig(os.path.join(report_dir, "false_negatives_%s" % (class_names[j],)))
+        plt.savefig(os.path.join(report_dir, "false_negatives_%s.png" % (class_names[j],)))
 
     # Save the report
     with open(os.path.join(report_dir, 'stats.json'), 'w') as jfile:
         json.dump(report, jfile)
+
+    # Visualize heat maps
+
+    # Read a batch of data
+    img, label = next(iter(dl))
+    img_d = img.to(device)
+    plt.figure(figsize=(16, 16))
+    show(torchvision.utils.make_grid(img, padding=10, nrow=8, normalize=True))
+    plt.savefig(os.path.join(report_dir, "example_patches.png"))
+
+    # Do a manual forward run of the model
+    x_clas = model_ft.forward_to_classifier(img_d)
+    x_cpool = model_ft.spatial_pooling.class_wise(x_clas)
+    x_spool = model_ft.spatial_pooling.spatial(x_cpool)
+
+    # Generate burden maps for each class
+    for mode in ('activation', 'softmax'):
+        for j in range(num_classes):
+            plt.figure(figsize=(20, 5))
+            plt.suptitle('Class %s %s' % (class_names[j], mode), fontsize=14)
+            for i in range(0, batch_size):
+                plt.subplot(2, batch_size // 2, i + 1)
+                plt.title(class_names[label[i]])
+                activation = x_cpool[i, :, :, :].cpu().detach().numpy()
+                if mode == 'softmax':
+                    softmax = scipy.special.softmax(activation, axis=0)
+                    plt.imshow(softmax[j, :, :], vmin=0, vmax=1, cmap=plt.get_cmap('jet'))
+                else:
+                    plt.imshow(activation[j, :, :], vmin=0, vmax=12, cmap=plt.get_cmap('jet'))
+            plt.savefig(os.path.join(report_dir, "example_%s_%s.png" % (class_names[j],mode)))
 
 
 # Set up an argument parser
