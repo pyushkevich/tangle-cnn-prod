@@ -451,7 +451,6 @@ def do_train(arg):
     }
 
     # Save the configuration
-    print(config)
     with open(os.path.join(model_dir, 'config.json'), 'w') as jfile:
         json.dump(config, jfile)
 
@@ -533,7 +532,7 @@ def do_val(arg):
     all_true = np.array([])
     all_pred = np.array([])
     with torch.no_grad():
-        for img, label, paths in dl:
+        for img, label in dl:
             img_d = img.to(device)
             label_d = label.to(device)
             outputs = model_ft(img_d)
@@ -572,6 +571,10 @@ def do_val(arg):
     for j in range(num_classes):
         plot_error(img_fn, j, 'negatives', class_names, cm)
         plt.savefig(os.path.join(report_dir, "false_negatives_%s" % (class_names[j],)))
+
+    # Save the report
+    with open(os.path.join(report_dir, 'stats.json'), 'w') as jfile:
+        json.dump(report, jfile)
 
 
 # Set up an argument parser
