@@ -21,6 +21,7 @@ import SimpleITK as sitk
 import threading
 import parse
 import traceback
+import matplotlib.pyplot as plt
 from unet_wildcat import *
 from osl_worker import osl_worker, osl_read_chunk_from_queue
 import wildcat_pytorch.wildcat as wildcat
@@ -450,6 +451,124 @@ def do_train(arg):
         json.dump(config, jfile)
 
 
+# Function to show a batch of images from Pytorch
+def show(img):
+    npimg = img.numpy()
+    plt.imshow(np.transpose(npimg, (1,2,0)), interpolation='nearest')
+
+
+# Function to plot false positives or negatives
+def plot_error(img, j, err_type, class_names, cm):
+    num_fp = img[j].shape[0]
+    sub_fp = np.random.choice(num_fp,min(14,num_fp),replace=False)
+    if num_fp > 0:
+        plt.figure(figsize=(16,16))
+        show(torchvision.utils.make_grid(img[j][sub_fp,:,:,:], padding=10, nrow=7, normalize=True))
+    else:
+        plt.figure(figsize=(16,2))
+    marginal = cm[j,:] if err_type is 'positives' else cm[:,j]
+    plt.title("Examples of false %s for %s: (%d out of %d patches)" %
+              (err_type, class_names[j], sum(marginal)-marginal[j],sum(marginal)))
+
+
+def do_val(arg):
+    global device
+
+    # Read the experiment directory
+    exp_dir = arg.expdir
+
+    # Set main directories
+    data_dir = os.path.join(exp_dir, "patches")
+    model_dir = os.path.join(exp_dir, "models")
+
+    # Load model configuration from config.json
+    with open(os.path.join(model_dir, 'config.json'), 'r') as jfile:
+        config = json.load(jfile)
+
+    # Set global properties
+    num_classes = config['num_classes']
+    input_size = config['wildcat_upsample']['input_size']
+    batch_size = config['wildcat_upsample']['batch_size']
+
+    # Create the model
+    model_ft = resnet50_wildcat_upsample(
+        config['num_classes'],
+        pretrained=True,
+        kmax=config['wildcat_upsample']['kmax'],
+        kmin=config['wildcat_upsample']['kmin'],
+        alpha=config['wildcat_upsample']['alpha'],
+        num_maps=config['wildcat_upsample']['num_maps'])
+
+    # Read model state
+    model_ft.load_state_dict(
+        torch.load(os.path.join(model_dir, "wildcat_upsample.dat")))
+
+    # Send model to GPU
+    model_ft.eval()
+    model_ft = model_ft.to(device)
+
+    # Create a data loader
+    dt = transforms.Compose([
+        transforms.CenterCrop(input_size),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+    ds = datasets.ImageFolder(os.path.join(data_dir, "test"), dt)
+    dl = torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=4)
+
+    # Create array of class names
+    class_names = [''] * num_classes
+    for k, v in config['class_to_idx'].items():
+        class_names[v] = k
+
+    # Perform full test set evaluation and save examples of errors
+    cm = np.zeros((num_classes, num_classes))
+    img_fp = [torch.empty(0)] * num_classes
+    img_fn = [torch.empty(0)] * num_classes
+    all_true = np.array([])
+    all_pred = np.array([])
+    with torch.no_grad():
+        for img, label, paths in dl:
+            img_d = img.to(device)
+            label_d = label.to(device)
+            outputs = model_ft(img_d)
+            _, preds = torch.max(outputs, 1)
+            all_true = np.append(all_true, label.numpy())
+            scores = outputs.cpu().numpy()
+            all_pred = np.append(all_pred, scores[:, 1] - scores[:, 0])
+            for a in range(0, len(label)):
+                l_pred = preds.cpu()[a].item()
+                l_true = label[a].item()
+                cm[l_pred, l_true] = cm[l_pred, l_true] + 1
+
+                # Keep track of false positives and false negatives for each class
+                if l_pred != l_true:
+                    img_a = img_d[a:a + 1, :, :, :].cpu()
+                    img_fp[l_pred] = torch.cat((img_fp[l_pred], img_a))
+                    img_fn[l_true] = torch.cat((img_fn[l_true], img_a))
+
+    # Path for the report
+    report_dir = os.path.join(exp_dir, 'test_model')
+    os.makedirs(report_dir, exist_ok=True)
+
+    # JSon for the report
+    report = {
+        'confusion_matrix': cm.tolist(),
+        'overall_accuracy': np.sum(np.diag(cm)) / np.sum(cm),
+        'class_accuracy': {k: 1 - (np.sum(cm[i, :]) + np.sum(cm[:, i]) - 2 * cm[i, i]) / np.sum(cm)
+                           for k, i in config['class_to_idx'].items()}
+    }
+
+    # Generate true and false positives
+    for j in range(num_classes):
+        plot_error(img_fp, j, 'positives', class_names, cm)
+        plt.savefig(os.path.join(report_dir, "false_positives_%s" % (class_names[j],)))
+
+    for j in range(num_classes):
+        plot_error(img_fn, j, 'negatives', class_names, cm)
+        plt.savefig(os.path.join(report_dir, "false_negatives_%s" % (class_names[j],)))
+
+
 # Set up an argument parser
 parser = argparse.ArgumentParser()
 subparsers = parser.add_subparsers()
@@ -464,6 +583,10 @@ train_parser.add_argument('--alpha', help='WildCat alpha parameter', default=0.7
 train_parser.add_argument('--nmaps', help='WildCat number of maps parameter', default=4)
 train_parser.add_argument('--erasing', help='Whether to perform erasing augmentation', default=False)
 train_parser.set_defaults(func=do_train)
+
+val_parser = subparsers.add_parser('validate')
+val_parser.add_argument('--expdir', help='experiment directory')
+val_parser.set_defaults(func=do_val)
 
 apply_parser = subparsers.add_parser('apply')
 apply_parser.add_argument('--slide', help='Input histology slide to process')
