@@ -230,8 +230,12 @@ def do_apply(args):
     print("Spacing of the mri-like image: %gx%gmm\n" % (sx, sy))
 
     # Write the result as a NIFTI file
-    nii = sitk.GetImageFromArray(np.transpose(density, (2,1,0)), True)
+    nii_data = np.transpose(density, (2,1,0))
+    print('Output data shape: ', nii_data.shape)
+    nii = sitk.GetImageFromArray(nii_data, True)
+    print('Setting spacing to', (sx,sy))
     nii.SetSpacing((sx, sy))
+    print("Density map will be saved to ", args.output)
     sitk.WriteImage(nii, args.output)
 
 
