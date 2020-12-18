@@ -85,7 +85,7 @@ fi
 # Download the model if needed
 if [[ "${NETWORK_URL?}" =~ gs:// ]]; then
   mkdir -p "$WDIR/model"
-  gsutil cp "$NETWORK_URL/*" "$WDIR/model/" || echo "Unable to download $NETWORK_URL" && exit 255
+  gsutil cp "$NETWORK_URL/*" "$WDIR/model/" || (echo "Unable to download $NETWORK_URL" && exit 255)
   NETWORK_URL=$WDIR/model
 fi
 
@@ -119,6 +119,6 @@ python -u wildcat_main.py apply \
 
 # Send the output to GCP if needed
 if [[ "${DENSITY_URL?}" =~ gs:// ]]; then
-  gsutil -m cp "$DENSITY_NII" "$DENSITY_URL" || echo "Unable to upload $DENSITY_URL" && exit 255
+  gsutil -m cp "$DENSITY_NII" "$DENSITY_URL" || (echo "Unable to upload $DENSITY_URL" && exit 255)
 fi
 
