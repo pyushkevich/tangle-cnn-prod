@@ -4,7 +4,7 @@ USER root
 
 # Some packages
 RUN apt-get update
-RUN apt-get install -y wget curl gcc openslide-tools python2.7
+RUN apt-get install -y wget curl gcc openslide-tools python2.7 vim
 
 # Downloading gcloud package
 RUN curl https://dl.google.com/dl/cloudsdk/release/google-cloud-sdk.tar.gz > /tmp/google-cloud-sdk.tar.gz

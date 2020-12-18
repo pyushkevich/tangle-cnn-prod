@@ -15,7 +15,14 @@ spec:
       - name: my-gpu-container-torch
         image: pyushkevich/tangle-cnn-prod:latest
         command: ["/bin/bash"]
-        args: ["process_slide_full.sh", "cfn-cluster-test", "INDD106312", "316247", "Tau", "tangles"]
+        args: ["wildcat_analyze_wsi.sh",
+               "-p", "cfn-cluster-test",
+               "-k", "/var/secrets/google/key.json",
+               "-s", "%SLIDE_URL%",
+               "-n", "%NETWORK_URL%",
+               "-d", "%DENSITY_URL%",
+               "-W", "1536", "-D", "16",
+        ]
         resources:
           limits:
             nvidia.com/gpu: 1
