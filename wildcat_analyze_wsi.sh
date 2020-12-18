@@ -10,7 +10,7 @@ usage:
 required options:
   -s <file|url>              Path or gs:// URL to the input whole-slide image
   -n <file|url>              Path or gs:// URL to the folder containing trained network
-  -d <file|url>              Path or gs:// URL to the output density .nii.gz file
+  -o <file|url>              Path or gs:// URL to the output density .nii.gz file
 additional options:
   -p <project_name>          Specify GCP project id (for GCP-stored data)
   -k <key_json>              Specify the secret key for desired GCP service account
@@ -37,11 +37,11 @@ unset SLIDE_URL NETWORK_URL DENSITY_URL PROJECT_ID PROJECT_KEY TIFF_PATTERN
 DOWNSAMPLING=4
 WINDOWSIZE=2048
 
-while getopts ":s:n:d:p:k:t:D:W:" opt; do
+while getopts ":s:n:o:p:k:t:D:W:" opt; do
   case ${opt} in
     s ) SLIDE_URL=$OPTARG;;
     n ) NETWORK_URL=$OPTARG;;
-    d ) DENSITY_URL=$OPTARG;;
+    o ) DENSITY_URL=$OPTARG;;
     p ) PROJECT_ID=$OPTARG;;
     k ) PROJECT_KEY=$OPTARG;;
     t ) TIFF_PATTERN=$OPTARG;;
@@ -78,7 +78,7 @@ SLIDE_BN_NOEXT=${SLIDE_BN/\..*$/\.tiff}
 
 # Download the input file if needed
 if [[ "${SLIDE_URL?}" =~ gs:// ]]; then
-  gsutil -m cp "$SLIDE_URL" "$WDIR/" || echo "Unable to download $SLIDE_URL" && exit 255
+  gsutil -m cp "$SLIDE_URL" "$WDIR/" || (echo "Unable to download $SLIDE_URL" && exit 255)
   SLIDE_URL=$WDIR/$SLIDE_BN
 fi
 
@@ -110,7 +110,7 @@ if [[ $LEVELS -le 1 ]]; then
 fi
 
 # Perform the scanning in Python
-python -u scan_tangles.py apply \
+python -u wildcat_main.py apply \
   --modeldir "$NETWORK_URL" \
   --slide "$SLIDE_URL" \
   --output "$DENSITY_NII" \

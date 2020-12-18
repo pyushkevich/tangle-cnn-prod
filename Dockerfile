@@ -1,10 +1,11 @@
 # Need CUDA!
-FROM anibali/pytorch:cuda-10.0
+FROM anibali/pytorch:1.7.0-cuda11.0
 USER root
 
 # Some packages
+ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update
-RUN apt-get install -y wget curl gcc openslide-tools python2.7 vim
+RUN apt-get install -y wget curl gcc openslide-tools vim
 
 # Downloading gcloud package
 RUN curl https://dl.google.com/dl/cloudsdk/release/google-cloud-sdk.tar.gz > /tmp/google-cloud-sdk.tar.gz
