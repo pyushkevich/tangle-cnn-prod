@@ -20,23 +20,25 @@ def apply_to_slide(args):
     model.eval()
 
     # Read the slide
-    I = np.asarray(Image.open(args.slide))
+    I = Image.open(args.slide)
+    h,w=I.size
 
     # Split the transforms
     tran_tt = transforms.ToTensor()
-    tran_model = transforms.Compose([
+    tran_model=transforms.Compose([
+        transforms.ToPILImage(),
         transforms.Resize(256),
         transforms.CenterCrop(224),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
-
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                  std=[0.229, 0.224, 0.225])])
+    
     # Get the patch size and downsample factor
     patch_size, ds = int(args.patch), int(args.downsample)
 
-    # Input dimensions
-    (w, h) = I.shape[0], I.shape[1]
-
     # Image as tensor
-    IT = tran_tt(I[0:ds * int(w / ds), 0:ds * int(h / ds)])
+    I_crop=I.crop((0, 0, ds*int(h/ds), ds*int(w/ds)))
+    IT = tran_tt(I_crop)
 
     # Image unfolded into patches
     IT_unfold = IT.unfold(1, patch_size, ds).unfold(2, patch_size, ds).permute(1, 2, 0, 3, 4)
@@ -51,9 +53,11 @@ def apply_to_slide(args):
     bs = int(args.batch_size)
     for k in range(0, batches.shape[0], bs):
         k_end = min(k + bs, batches.shape[0])
-        batch = tran_model(batches[k:k_end, :, :, :]).cuda()
+        batch=torch.zeros((k_end-k,3,224,224))
+        for j in range(k,k_end):
+            batch[j-k,:,:,:]=tran_model(batches[j,:,:,:])
         with torch.no_grad():
-            res_batch = model(batch).detach().cpu()
+            res_batch=model(batch.cuda()).detach().cpu()
             if k == 0:
                 result = res_batch
             else:
@@ -76,7 +80,7 @@ def apply_to_slide(args):
 
     # Write the optional thumb
     if args.thumb is not None:
-        rgb = np.asarray(Image.fromarray(I).resize((ohp,owp),Image.LANCZOS))
+        rgb = np.asarray(I.resize((ohp,owp),Image.LANCZOS))
         nii = sitk.GetImageFromArray(rgb, True)
         nii.SetSpacing((ds, ds))
         sitk.WriteImage(nii, args.thumb)
