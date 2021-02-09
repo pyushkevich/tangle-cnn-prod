@@ -6,3 +6,4 @@ matplotlib
 openslide-python
 SimpleITK
 parse
+PIL
