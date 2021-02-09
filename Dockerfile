@@ -1,5 +1,6 @@
 # Need CUDA!
-FROM anibali/pytorch:1.7.0-cuda11.0
+# FROM anibali/pytorch:1.7.0-cuda11.0
+FROM pytorch/pytorch:1.6.0-cuda10.1-cudnn7-runtime
 USER root
 
 # Some packages
@@ -9,6 +10,20 @@ RUN apt-get install -y wget curl gcc openslide-tools vim
 
 # Downloading gcloud package
 RUN curl https://dl.google.com/dl/cloudsdk/release/google-cloud-sdk.tar.gz > /tmp/google-cloud-sdk.tar.gz
+
+# Create a working directory
+RUN mkdir /app
+WORKDIR /app
+
+# Create a non-root user and switch to it
+RUN adduser --disabled-password --gecos '' --shell /bin/bash user \
+ && chown -R user:user /app
+RUN apt-get install -y sudo
+RUN echo "user ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/90-user
+
+# All users can use /home/user as their home directory
+ENV HOME=/home/user
+RUN chmod 777 /home/user
 
 # Installing the package
 RUN mkdir -p /usr/local/gcloud \
@@ -28,7 +43,7 @@ RUN wget ${VIPS_URL}/v${VIPS_VERSION}/vips-${VIPS_VERSION}.tar.gz \
   && tar xf vips-${VIPS_VERSION}.tar.gz \
   && cd vips-${VIPS_VERSION} \
   && ./configure \
-  && make V=0 \
+  && make V=0 -j $(nproc) \
   && make install
 
 # Needed by VIPS
@@ -45,7 +60,7 @@ COPY . /app/
 # Run pip
 RUN pip install -r /app/requirements.txt
 
-# Switch to actual user again
+# Switch to our user
 USER user
 
 # Add pythonpath
