@@ -6,8 +6,10 @@ id=${2?}
 svs=${3?}
 
 # Activate service account
-gcloud auth activate-service-account --key-file /var/secrets/google/key.json
-gcloud config set project $project_id
+if [[ -f /var/secrets/google/key.json ]]; then
+  gcloud auth activate-service-account --key-file /var/secrets/google/key.json
+  gcloud config set project $project_id
+fi
 
 # Download the SVS
 mkdir -p ./data ./model

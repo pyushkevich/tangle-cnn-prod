@@ -5,6 +5,9 @@ import numpy as np
 import argparse
 import SimpleITK as sitk
 from PIL import Image
+import sys
+
+sys.path.append("deepcluster")
 from deepcluster.util import load_model
 
 
@@ -27,7 +30,7 @@ def apply_to_slide(args):
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
 
     # Get the patch size and downsample factor
-    patch_size, ds = args.patch, args.downsample
+    patch_size, ds = int(args.patch), int(args.downsample)
 
     # Input dimensions
     (w, h) = I.shape[0], I.shape[1]
@@ -45,8 +48,9 @@ def apply_to_slide(args):
     batches = IT_unfold.reshape(-1, 3, patch_size, patch_size)
 
     # Break into digestable batches
-    for k in range(0, batches.shape[0], args.batch_size):
-        k_end = min(k + args.batch_size, batches.shape[0])
+    bs = int(args.batch_size)
+    for k in range(0, batches.shape[0], bs):
+        k_end = min(k + bs, batches.shape[0])
         batch = tran_model(batches[k:k_end, :, :, :]).cuda()
         with torch.no_grad():
             res_batch = model(batch).detach().cpu()
@@ -54,7 +58,7 @@ def apply_to_slide(args):
                 result = res_batch
             else:
                 result = torch.cat((result, res_batch), 0)
-        print('Batch %d of %d' % (k / args.batch_size, batches.shape[0] / args.batch_size))
+        print('Batch %d of %d' % (k / bs, batches.shape[0] / bs))
 
     # Reformat into a 20xWxH image
     Z = result.permute(1, 0).reshape(-1, ow, oh)
@@ -66,7 +70,7 @@ def apply_to_slide(args):
     Z = torch.nn.functional.pad(Z, (ph0, ph1, pw0, pw1, 0, 0), 'constant', 0)
 
     # Write the result as a NIFTI file
-    nii = sitk.GetImageFromArray(np.transpose(Z, (0, 1, 2)), True)
+    nii = sitk.GetImageFromArray(Z.permute(1,2,0), True)
     nii.SetSpacing((ds, ds))
     sitk.WriteImage(nii, args.output)
 
