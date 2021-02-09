@@ -29,16 +29,22 @@ fi
 
 # Run the code
 for svslocal in ./data/*.jpg; do
+  svs=$(basename $svslocal .jpg)
   python -u blockface_to_multichannel.py apply \
     --slide $svslocal \
-    --output ./data/${svslocal/.jpg/_deepcluster.nii.gz} \
+    --output ./data/${svs}_deepcluster.nii.gz \
+    --thumb ./data/${svs}_deepcluster_rgb.nii.gz \
     --network ./model/deepcluster.alexnet.tar \
     --patch 64 --downsample 16 --batch-size 256
+
+  break
 done
 
 # Copy result up to storage
 for nii in ./data/*_deepcluster.nii.gz; do
-  TRG_URL="gs://mtl_histology/$id/bf_proc/${nii/_deepcluster.nii.gz/}/preproc/${nii}"
-  gsutil -m cp $nii "$TRG_URL"
+  svs=$(basename $nii _deepcluster.nii.gz)
+  thumb=${nii/.nii.gz/_rgb.nii.gz}
+  TRG_URL="gs://mtl_histology/$id/bf_proc/${svs}/preproc/"
+  gsutil -m cp $nii $thumb "$TRG_URL"
 done
 

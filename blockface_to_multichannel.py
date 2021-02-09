@@ -74,6 +74,13 @@ def apply_to_slide(args):
     nii.SetSpacing((ds, ds))
     sitk.WriteImage(nii, args.output)
 
+    # Write the optional thumb
+    if args.thumb is not None:
+        rgb = np.asarray(Image.fromarray(I).resize((ohp,owp),Image.LANCZOS))
+        nii = sitk.GetImageFromArray(rgb, True)
+        nii.SetSpacing((ds, ds))
+        sitk.WriteImage(nii, args.thumb)
+
 
 # Set up an argument parser
 parser = argparse.ArgumentParser()
@@ -82,6 +89,7 @@ subparsers = parser.add_subparsers()
 apply_parser = subparsers.add_parser('apply')
 apply_parser.add_argument('--slide', help='Input histology slide to process')
 apply_parser.add_argument('--output', help='Where to store the output density map')
+apply_parser.add_argument('--thumb', help='Optional thumbnail output', default=None)
 apply_parser.add_argument('--network', help='Network saved during training')
 apply_parser.add_argument('--patch', help='Patch size used during training', default=64)
 apply_parser.add_argument('--downsample', help='Input to output downsampling ratio', default=16)
