@@ -62,8 +62,6 @@ for svslocal in ./data/*.jpg; do
     --thumb ./data/${svs}_deepcluster_rgb.nii.gz \
     --network ./model/deepcluster.alexnet.tar \
     --patch 64 --downsample 16 --batch-size 256
-
-  break
 done
 
 # Copy result up to storage
