@@ -54,11 +54,12 @@ ARG C3D_URL=https://sourceforge.net/projects/c3d/files/c3d/Nightly/c3d-nightly-L
 RUN wget -q ${C3D_URL} \
  && tar -zxvf c3d-nightly-Linux-gcc64.tar.gz --strip 1 -C /usr/local
 
+# Run pip
+COPY requirements.txt /app/
+RUN pip install -r /app/requirements.txt
+
 # Copy internals
 COPY . /app/
-
-# Run pip
-RUN pip install -r /app/requirements.txt
 
 # Switch to our user
 USER user
