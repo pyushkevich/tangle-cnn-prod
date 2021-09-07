@@ -1,13 +1,28 @@
 # Need CUDA!
-FROM anibali/pytorch:cuda-10.0
+FROM pytorch/pytorch:1.6.0-cuda10.1-cudnn7-runtime
 USER root
 
 # Some packages
-RUN apt-get update
-RUN apt-get install -y wget curl gcc openslide-tools python2.7
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update --fix-missing
+RUN apt-get install -y wget curl gcc openslide-tools 
 
 # Downloading gcloud package
 RUN curl https://dl.google.com/dl/cloudsdk/release/google-cloud-sdk.tar.gz > /tmp/google-cloud-sdk.tar.gz
+
+# Create a working directory
+RUN mkdir /app
+WORKDIR /app
+
+# Create a non-root user and switch to it
+RUN adduser --disabled-password --gecos '' --shell /bin/bash user \
+ && chown -R user:user /app
+RUN apt-get install -y sudo
+RUN echo "user ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/90-user
+
+# All users can use /home/user as their home directory
+ENV HOME=/home/user
+RUN chmod 777 /home/user
 
 # Installing the package
 RUN mkdir -p /usr/local/gcloud \
@@ -39,10 +54,13 @@ RUN wget -q ${C3D_URL} \
  && tar -zxvf c3d-nightly-Linux-gcc64.tar.gz --strip 1 -C /usr/local
 
 # Copy internals
-COPY . /app/
+COPY ./requirements.txt /app/requirements.txt
 
 # Run pip
 RUN pip install -r /app/requirements.txt
+
+# Copy internals
+COPY . /app/
 
 # Switch to actual user again
 USER user
