@@ -25,6 +25,7 @@ import matplotlib.pyplot as plt
 from unet_wildcat import *
 from osl_worker import osl_worker, osl_read_chunk_from_queue
 import wildcat_pytorch.wildcat as wildcat
+from unet_wildcat_gmm import UNet_WSL_GMM
 
 
 # Set up the device (CPU/GPU)
@@ -267,7 +268,8 @@ def train_model(model, dataloaders, criterion, optimizer, num_epochs=25):
             running_corrects = 0
 
             # Iterate over data.
-            for inputs, labels in dataloaders[phase]:
+            nmb = len(dataloaders[phase])
+            for mb, (inputs, labels) in enumerate(dataloaders[phase]):
                 inputs = inputs.to(device)
                 labels = labels.to(device)
                 labels_one_hot = torch.zeros([labels.shape[0], num_classes])
@@ -294,6 +296,10 @@ def train_model(model, dataloaders, criterion, optimizer, num_epochs=25):
                     if phase == 'train':
                         loss.backward()
                         optimizer.step()
+
+                # Print minimatch stats
+                print('MB %04d/%04d  loss %f  corr %d' %
+                        (mb, nmb, loss.item(), torch.sum(preds == labels.data).item()))
 
                 # statistics
                 running_loss += loss.item() * inputs.size(0)
@@ -330,18 +336,38 @@ def do_train(arg):
     # Read the experiment directory
     exp_dir = arg.expdir
 
-    # Set up the configuration
-    config = {
-        "wildcat_upsample": {
-            "kmax": float(arg.kmax),
-            "kmin": float(arg.kmin),
-            "alpha": float(arg.alpha),
-            "num_maps": int(arg.nmaps),
-            "input_size": 224,
-            "num_epochs": int(arg.epochs),
-            "batch_size": int(arg.batch)
+    # Save the model using a format that can be read using production-time scripts
+    model_dir = os.path.join(exp_dir, "models")
+    os.makedirs(model_dir, exist_ok=True)
+
+    # The location of the config file
+    config_file = os.path.join(model_dir, 'config.json')
+    model_file = os.path.join(model_dir, 'wildcat_upsample.dat')
+
+    # Are we resuming - then load old parameters
+    if bool(arg.resume) is True:
+        print('Loading config parameters from', config_file)
+        with open(config_file, 'r') as jfile:
+            config = json.load(jfile)
+            hist_train = config['train_history']['train']
+            hist_val = config['train_history']['val']
+    else:
+        # Set up the configuration
+        config = {
+            "wildcat_upsample": {
+                "kmax": float(arg.kmax),
+                "kmin": float(arg.kmin),
+                "alpha": float(arg.alpha),
+                "num_maps": int(arg.nmaps),
+                "input_size": 224,
+                "num_epochs": int(arg.epochs),
+                "batch_size": int(arg.batch),
+                "gmm" : bool(arg.gmm)
+            }
         }
-    }
+
+        hist_train=[]
+        hist_val=[]
 
     # Transforms for training and validation
     input_size = config['wildcat_upsample']['input_size']
@@ -381,24 +407,42 @@ def do_train(arg):
     print("Training configuration:")
     print(config)
 
-    # Instantiate WildCat model
-    model = resnet50_wildcat_upsample(
-        config['num_classes'],
-        pretrained=True,
-        kmax=config['wildcat_upsample']['kmax'],
-        kmin=config['wildcat_upsample']['kmin'],
-        alpha=config['wildcat_upsample']['alpha'],
-        num_maps=config['wildcat_upsample']['num_maps'])
+    # Instantiate WildCat model, loss and optiizer
+    if config['wildcat_upsample']['gmm']:
+        model = UNet_WSL_GMM(
+                num_classes = config['num_classes'],
+                mix_per_class=config['wildcat_upsample']['num_maps'], 
+                kmax=config['wildcat_upsample']['kmax'], 
+                kmin=config['wildcat_upsample']['kmin'],
+                alpha=config['wildcat_upsample']['alpha'])
+
+        # We use BCE loss because network outputs are probabilities, and this loss
+        # does log clamping to prevent infinity or NaN in the gradients
+        criterion = torch.nn.BCELoss()
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.001, momentum=0.9, weight_decay=1e-2)
+
+    else:
+        model = resnet50_wildcat_upsample(
+            config['num_classes'],
+            pretrained=True,
+            kmax=config['wildcat_upsample']['kmax'],
+            kmin=config['wildcat_upsample']['kmin'],
+            alpha=config['wildcat_upsample']['alpha'],
+            num_maps=config['wildcat_upsample']['num_maps'])
+
+        # Loss and optimizer
+        criterion = nn.MultiLabelSoftMarginLoss()
+        optimizer = torch.optim.SGD(model.get_config_optim(0.01, 0.1), lr=0.01, momentum=0.9, weight_decay=1e-2)
+
+    # Load the model if resuming
+    if bool(arg.resume) is True:
+        model.load_state_dict(torch.load(model_file))
 
     # Generate a weighted sampler
     class_counts = np.array(list(map(lambda x: image_datasets['train'].targets.count(x), range(config['num_classes']))))
     sample_weights = torch.DoubleTensor([1. / class_counts[i] for i in image_datasets['train'].targets])
     weighted_sampler = torch.utils.data.sampler.WeightedRandomSampler(sample_weights, len(sample_weights),
                                                                       replacement=True)
-
-    # Loss and optimizer
-    criterion = nn.MultiLabelSoftMarginLoss()
-    optimizer = torch.optim.SGD(model.get_config_optim(0.01, 0.1), lr=0.01, momentum=0.9, weight_decay=1e-2)
 
     # Training and validation data loaders
     dataloaders_dict = {
@@ -417,15 +461,15 @@ def do_train(arg):
     criterion = criterion.to(device)
 
     # Run the training
-    model_ft, hist_val, hist_train = \
+    model_ft, hist_val_run, hist_train_run = \
         train_model(model, dataloaders_dict, criterion, optimizer, num_epochs=config['wildcat_upsample']['num_epochs'])
 
-    # Save the model using a format that can be read using production-time scripts
-    model_dir = os.path.join(exp_dir, "models")
-    os.makedirs(model_dir, exist_ok=True)
+    # Append the histories
+    hist_val.append(hist_val_run)
+    hist_train.append(hist_train_run)
 
     # Save the model
-    torch.save(model_ft.state_dict(), os.path.join(model_dir, "wildcat_upsample.dat"))
+    torch.save(model_ft.state_dict(), model_file)
 
     # Add training history to saved config
     config['train_history'] = {
@@ -434,7 +478,7 @@ def do_train(arg):
     }
 
     # Save the configuration
-    with open(os.path.join(model_dir, 'config.json'), 'w') as jfile:
+    with open(config_file, 'w') as jfile:
         json.dump(config, jfile)
 
 
@@ -603,6 +647,8 @@ train_parser.add_argument('--kmin', help='WildCat k_min parameter', default=0.0)
 train_parser.add_argument('--alpha', help='WildCat alpha parameter', default=0.7)
 train_parser.add_argument('--nmaps', help='WildCat number of maps parameter', default=4)
 train_parser.add_argument('--erasing', help='Whether to perform erasing augmentation', default=False)
+train_parser.add_argument('--gmm', help='Use experimental Gaussian Mixture Model network', default=False)
+train_parser.add_argument('--resume', help='Resume training using previously saved parameters', default=False)
 train_parser.set_defaults(func=do_train)
 
 val_parser = subparsers.add_parser('validate')
