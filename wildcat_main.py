@@ -43,6 +43,42 @@ def read_openslide_chunk(osl, pos, level, size):
     chunk_img=osl.read_region(pos, level, size).convert("RGB")
 
 
+def make_model(config):
+    """Instantiate a model, loss, and optimizer based on the config dict"""
+    mcfg = config['wildcat_upsample']
+    
+    # Instantiate WildCat model, loss and optiizer
+    if mcfg['gmm'] > 0:
+        model = UNet_WSL_GMM(
+            num_classes = config['num_classes'],
+            mix_per_class=mcfg['num_maps'],
+            kmax=mcfg['kmax'],
+            kmin=mcfg['kmin'],
+            alpha=mcfg['alpha'],
+            gmm_iter=mcfg['gmm']
+        )
+
+        # We use BCE loss because network outputs are probabilities, and this loss
+        # does log clamping to prevent infinity or NaN in the gradients
+        criterion = torch.nn.BCELoss()
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.001, momentum=0.9, weight_decay=1e-2)
+
+    else:
+        model = resnet50_wildcat_upsample(
+            config['num_classes'],
+            pretrained=True,
+            kmax=mcfg['kmax'],
+            kmin=mcfg['kmin'],
+            alpha=mcfg['alpha'],
+            num_maps=mcfg['num_maps'])
+
+        # Loss and optimizer
+        criterion = nn.MultiLabelSoftMarginLoss()
+        optimizer = torch.optim.SGD(model.get_config_optim(0.01, 0.1), lr=0.01, momentum=0.9, weight_decay=1e-2)
+
+    return model, criterion, optimizer
+
+
 # Function to apply training to a slide
 def do_apply(args):
 
@@ -54,13 +90,7 @@ def do_apply(args):
         config=json.load(json_file)
 
     # Create the model
-    model_ft = resnet50_wildcat_upsample(
-        config['num_classes'],
-        pretrained=True,
-        kmax=config['wildcat_upsample']['kmax'],
-        kmin=config['wildcat_upsample']['kmin'],
-        alpha=config['wildcat_upsample']['alpha'],
-        num_maps=config['wildcat_upsample']['num_maps'])
+    model_ft,_,_ = make_model(config)
 
     # Read model state
     model_ft.load_state_dict(
@@ -362,7 +392,7 @@ def do_train(arg):
                 "input_size": 224,
                 "num_epochs": int(arg.epochs),
                 "batch_size": int(arg.batch),
-                "gmm" : bool(arg.gmm)
+                "gmm" : arg.gmm
             }
         }
 
@@ -408,31 +438,7 @@ def do_train(arg):
     print(config)
 
     # Instantiate WildCat model, loss and optiizer
-    if config['wildcat_upsample']['gmm']:
-        model = UNet_WSL_GMM(
-                num_classes = config['num_classes'],
-                mix_per_class=config['wildcat_upsample']['num_maps'], 
-                kmax=config['wildcat_upsample']['kmax'], 
-                kmin=config['wildcat_upsample']['kmin'],
-                alpha=config['wildcat_upsample']['alpha'])
-
-        # We use BCE loss because network outputs are probabilities, and this loss
-        # does log clamping to prevent infinity or NaN in the gradients
-        criterion = torch.nn.BCELoss()
-        optimizer = torch.optim.SGD(model.parameters(), lr=0.001, momentum=0.9, weight_decay=1e-2)
-
-    else:
-        model = resnet50_wildcat_upsample(
-            config['num_classes'],
-            pretrained=True,
-            kmax=config['wildcat_upsample']['kmax'],
-            kmin=config['wildcat_upsample']['kmin'],
-            alpha=config['wildcat_upsample']['alpha'],
-            num_maps=config['wildcat_upsample']['num_maps'])
-
-        # Loss and optimizer
-        criterion = nn.MultiLabelSoftMarginLoss()
-        optimizer = torch.optim.SGD(model.get_config_optim(0.01, 0.1), lr=0.01, momentum=0.9, weight_decay=1e-2)
+    model,criterion,optimizer = make_model(config)
 
     # Load the model if resuming
     if bool(arg.resume) is True:
@@ -462,7 +468,8 @@ def do_train(arg):
 
     # Run the training
     model_ft, hist_val_run, hist_train_run = \
-        train_model(model, dataloaders_dict, criterion, optimizer, num_epochs=config['wildcat_upsample']['num_epochs'])
+        train_model(model, dataloaders_dict, criterion, optimizer,
+                    num_epochs=config['wildcat_upsample']['num_epochs'])
 
     # Append the histories
     hist_val.append(hist_val_run)
@@ -497,7 +504,7 @@ def plot_error(img, j, err_type, class_names, cm):
         show(torchvision.utils.make_grid(img[j][sub_fp,:,:,:], padding=10, nrow=7, normalize=True))
     else:
         plt.figure(figsize=(16,2))
-    marginal = cm[j,:] if err_type is 'positives' else cm[:,j]
+    marginal = cm[j,:] if err_type == 'positives' else cm[:,j]
     plt.title("Examples of false %s for %s: (%d out of %d patches)" %
               (err_type, class_names[j], sum(marginal)-marginal[j],sum(marginal)))
 
@@ -522,13 +529,7 @@ def do_val(arg):
     batch_size = config['wildcat_upsample']['batch_size']
 
     # Create the model
-    model_ft = resnet50_wildcat_upsample(
-        config['num_classes'],
-        pretrained=True,
-        kmax=config['wildcat_upsample']['kmax'],
-        kmin=config['wildcat_upsample']['kmin'],
-        alpha=config['wildcat_upsample']['alpha'],
-        num_maps=config['wildcat_upsample']['num_maps'])
+    model_ft,_,_ = make_model(config)
 
     # Read model state
     model_ft.load_state_dict(
@@ -638,6 +639,7 @@ def do_val(arg):
 parser = argparse.ArgumentParser()
 subparsers = parser.add_subparsers()
 
+# Configure the training parser
 train_parser = subparsers.add_parser('train')
 train_parser.add_argument('--expdir', help='experiment directory')
 train_parser.add_argument('--epochs', help='number of epochs', default=50)
@@ -646,15 +648,20 @@ train_parser.add_argument('--kmax', help='WildCat k_max parameter', default=0.02
 train_parser.add_argument('--kmin', help='WildCat k_min parameter', default=0.0)
 train_parser.add_argument('--alpha', help='WildCat alpha parameter', default=0.7)
 train_parser.add_argument('--nmaps', help='WildCat number of maps parameter', default=4)
-train_parser.add_argument('--erasing', help='Whether to perform erasing augmentation', default=False)
-train_parser.add_argument('--gmm', help='Use experimental Gaussian Mixture Model network', default=False)
-train_parser.add_argument('--resume', help='Resume training using previously saved parameters', default=False)
+train_parser.add_argument('--erasing', action='store_true',
+                          help='Whether to perform erasing augmentation')
+train_parser.add_argument('--gmm', type=int, metavar='N', default=0,
+                          help='Use Gaussian Mixture Model network with N iterations of EM')
+train_parser.add_argument('--resume', action='store_true',
+                          help='Resume training using previously saved parameters')
 train_parser.set_defaults(func=do_train)
 
+# Configure the validation parser
 val_parser = subparsers.add_parser('validate')
 val_parser.add_argument('--expdir', help='experiment directory')
 val_parser.set_defaults(func=do_val)
 
+# Configure the apply parser
 apply_parser = subparsers.add_parser('apply')
 apply_parser.add_argument('--slide', help='Input histology slide to process')
 apply_parser.add_argument('--modeldir', help='Directory containing the model')
@@ -664,8 +671,14 @@ apply_parser.add_argument('--window', help='Size of the window for scanning', de
 apply_parser.add_argument('--shrink', help='How much to downsample WildCat output', default=4)
 apply_parser.set_defaults(func=do_apply)
 
+# Configure the info parser
 info_parser = subparsers.add_parser('info')
 info_parser.set_defaults(func=do_info)
+
+# Add common options to all subparsers
+for sp in (train_parser, val_parser, apply_parser):
+    sp.add_argument('--device', type=str, default='cuda:0', metavar='D',
+                    help='Set the PyTorch device to D, e.g., cuda:0 or cpu')
 
 if __name__ == '__main__':
     args = parser.parse_args()
