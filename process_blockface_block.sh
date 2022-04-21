@@ -4,7 +4,9 @@
 project_id=${1?}
 id=${2?}
 block=${3?}
-force=${4}
+sec0=${4-0}
+sec1=${5-1000}
+force=${6}
 
 # Activate service account
 if [[ -f /var/secrets/google/key.json ]]; then
@@ -20,13 +22,27 @@ else
 fi
 
 # Get a list of inputs and outputs found
+LISTING=$WDIR/alljpg
 FINPUTS=$WDIR/inputs
 FOUTPUTS=$WDIR/outputs
 FNEEDED=$WDIR/needed
-for slice in 05 10; do
-  gsutil ls "gs://mtl_histology/$id/bf_raw/${id}_${block}_*_${slice}.jpg" >> $FINPUTS
+
+# List all blockface images and filter for the ones pertaining to this job
+gsutil ls "gs://mtl_histology/$id/bf_raw/${id}_${block}*.jpg" >> $LISTING
+rm -rf $FINPUTS
+for f in $(cat $LISTING); do
+    base=$(basename $f .jpg)
+    sec=$(echo $base | awk -F_ '{print $3}')
+    sld=$(echo $base | awk -F_ '{print $4}')
+    if [[ $sec -ge $sec0 && $sec -lt $sec1 ]]; then
+        if [[ $sld -eq 5 || $sld -eq 10 ]]; then
+            echo $f >> $FINPUTS
+        fi
+    fi
 done
 
+# List all the available outputs
+rm -rf $FOUTPUTS
 if ! gsutil ls "gs://mtl_histology/$id/bf_proc/${id}_${block}_**/*.nii.gz" > $FOUTPUTS; then
   touch $FOUTPUTS
 fi
