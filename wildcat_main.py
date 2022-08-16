@@ -3,14 +3,12 @@ from __future__ import print_function
 from __future__ import division
 import torch
 import torch.nn as nn
-import torch.optim as optim
 import numpy as np
 import torchvision
 from torchvision import datasets, models, transforms
 import time
 import os
 import copy
-import torch.cuda as cutorch
 import timeit
 import scipy.special
 import sys
@@ -20,16 +18,18 @@ import json
 import SimpleITK as sitk
 import threading
 import parse
+import glob
 import traceback
 import matplotlib.pyplot as plt
-from unet_wildcat import *
 from osl_worker import osl_worker, osl_read_chunk_from_queue
 import wildcat_pytorch.wildcat as wildcat
+from wildcat_pytorch.picsl_wildcat import models, util
 from unet_wildcat_gmm import UNet_WSL_GMM
+from PIL import Image
+import pandas as pd
 
 # Set up the device (CPU/GPU)
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def do_info(dummy_args):
     print("PyTorch Version: ", torch.__version__)
@@ -63,7 +63,7 @@ def make_model(config):
         optimizer = torch.optim.SGD(model.parameters(), lr=0.001, momentum=0.9, weight_decay=1e-2)
 
     else:
-        model = resnet50_wildcat_upsample(
+        model = models.resnet50_wildcat_upsample(
             config['num_classes'],
             pretrained=True,
             kmax=mcfg['kmax'],
@@ -80,6 +80,7 @@ def make_model(config):
 
 # Function to apply training to a slide
 def do_apply(args):
+
     # Set the model directory
     model_dir = args.modeldir
 
@@ -269,6 +270,103 @@ def do_apply(args):
     sitk.WriteImage(nii, args.output)
 
 
+# Function to apply training to a collection of extracted patches
+def do_patch_apply(args):
+
+    # Set the model directory
+    model_dir = args.modeldir
+
+    # Read the model's .json config file
+    with open(os.path.join(model_dir, 'config.json')) as json_file:
+        config = json.load(json_file)
+
+    # Number of classes in the model
+    num_classes = config['num_classes']
+
+    # Dict storing model statistics
+    d = { 'patches' : [], 'means': [], 'histograms': [] }
+
+    # Create the model
+    model_ft, _, _ = make_model(config)
+
+    # Read model state
+    model_ft.load_state_dict(
+        torch.load(os.path.join(model_dir, "wildcat_upsample.dat")))
+
+    # Send model to GPU
+    model_ft.eval()
+    model_ft = model_ft.to(device)
+    print("Model loaded to device")
+
+    # Find all the input files
+    allstat = {}
+
+    # Read all filenames to process
+    fn_list = glob.glob(os.path.join(args.input, "*.png"))
+    if len(fn_list) == 0:
+        print('Missing input files')
+        return 255
+
+    # Split into mini-batch chunks
+    fn_list_fold = [fn_list[i:i+args.batch] for i in range(0, len(fn_list), args.batch)]
+
+    # Read the first patch to determine the patch size
+    patch = Image.open(fn_list[0]).convert("RGB")
+
+    # Set up the transformation
+    pw,ph = int(patch.size[0] * args.scale),int(patch.size[1] * args.scale)
+    tran = transforms.Compose([
+        transforms.Resize((pw,ph)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+
+    # Set up the minibatch storage
+    chunk_tensor = torch.zeros(args.batch, 3, pw, ph).to(device)
+
+    # Process data in minibatches
+    for ib, b in enumerate(fn_list_fold):
+        print('Batch {} of {}'.format(ib, len(fn_list_fold)))
+        
+        # Load patches from images, transform, and stick into tensor
+        for ifn, fn in enumerate(b):
+            if ib > 0 and ifn > 0:
+                patch = Image.open(fn).convert("RGB")
+            chunk_tensor[ifn,:] = tran(patch).to(device)
+
+        # Process minibatch through model
+        with torch.no_grad():
+            x_clas = model_ft.forward_to_classifier(chunk_tensor)
+            x_cpool = model_ft.spatial_pooling.class_wise(x_clas)
+
+        # Collect statistics
+        for ifn, fn in enumerate(b):
+            # Get statistics for each class 
+            z = x_cpool.cpu().detach().numpy()
+            zstat = []
+            for k in range(num_classes):
+                zk = z[0,k,:,:].flatten()
+                zhist = np.histogram(zk, bins=np.linspace(-6.0, 6.0, 121), density=True)
+                zmean = np.mean(zk)
+                zstd = np.std(zk)
+                zstat.append({'histogram': zhist[0].tolist(), 'mean': zmean.item(), 'std': zstd.item()})
+            
+            # Append the statistics
+            allstat[os.path.basename(fn)] = zstat
+
+            # Write the image back to destination dir if requested
+            if args.outdir:
+                fn_dest = os.path.join(args.outdir, "wildcat_" + os.path.splitext(os.path.basename(fn))[0] + ".nii.gz")
+                dimg = x_cpool[0,:,:,:].cpu().numpy().transpose(1,2,0)
+                nii = sitk.GetImageFromArray(dimg, True)
+                sitk.WriteImage(nii, fn_dest)
+
+    # Write the output JSON file, if requested
+    if args.outstat:
+        with open(args.outstat, "w") as f_outstat:
+            json.dump(allstat, f_outstat)
+
+
 # Standard training code
 def train_model(model, dataloaders, criterion, optimizer, num_epochs=25):
     since = time.time()
@@ -395,6 +493,11 @@ def do_train(arg):
             }
         }
 
+        # Do we want bounding boxes
+        if arg.bbox is not None:
+            config["wildcat_upsample"]["bounding_box"] = True
+            config["wildcat_upsample"]["bounding_box_min_size"] = arg.bbox_min_size if arg.bbox_min_size > 0 else 112
+
         hist_train = []
         hist_val = []
 
@@ -405,28 +508,46 @@ def do_train(arg):
     # Create a list of transforms to compose
     data_transform_lists = {
         'train': [
-            transforms.RandomRotation(45),
-            transforms.RandomVerticalFlip(),
-            transforms.RandomHorizontalFlip(),
-            transforms.CenterCrop(input_size),
-            transforms.ToTensor(),
-            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+            util.NormalizeRGB([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
         ],
         'val': [
-            transforms.CenterCrop(input_size),
-            transforms.ToTensor(),
-            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-        ]
+            util.NormalizeRGB([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+            transforms.CenterCrop(input_size)
+        ],
     }
+
+    # Select the type of crop operation (random or centered)
+    if bool(arg.random_crop):
+        print('Augmentation using random crop transform')
+        data_transform_lists['train'].append(util.RandomCrop(input_size))    
+    else:
+        print('Augmentation using random rotation and center crop transform')
+        data_transform_lists['train'].append(transforms.RandomRotation(45))    
+        data_transform_lists['train'].append(transforms.CenterCrop())    
+
+    # Append the flip augmentations
+    data_transform_lists['train'].append(transforms.RandomVerticalFlip())
+    data_transform_lists['train'].append(transforms.RandomHorizontalFlip())
 
     # Add the optional erasing transform
     if bool(arg.erasing):
-        print('Adding erasing transform')
+        print('Augmentation using random erasing transform')
         data_transform_lists['train'].append(transforms.RandomErasing())
+
+    if arg.color_jitter is not None:
+        print('Augmentation using color jitter transform:', arg.color_jitter)
+        data_transform_lists['train'].insert(0, util.ColorJitterRGB(
+            arg.color_jitter[0], arg.color_jitter[1], arg.color_jitter[2], arg.color_jitter[3]))
 
     # Create image datasets
     data_transforms = {k: transforms.Compose(v) for k, v in data_transform_lists.items()}
-    image_datasets = {k: datasets.ImageFolder(os.path.join(data_dir, k), v) for k, v in data_transforms.items()}
+    if config["wildcat_upsample"]["bounding_box"]:
+        bbox_manifest = pd.read_csv(arg.bbox) 
+        bbox_max = config['wildcat_upsample']['bounding_box_min_size']
+    else:
+        bbox_manifest = None
+        bbox_max = 0
+    image_datasets = {k: util.ImageFolderWithBBox(os.path.join(data_dir, k), bbox_manifest, v, bbox_max) for k, v in data_transforms.items()}
 
     # Get the class name to index mapping
     config['class_to_idx'] = image_datasets['train'].class_to_idx
@@ -442,6 +563,9 @@ def do_train(arg):
     # Load the model if resuming
     if bool(arg.resume) is True:
         model.load_state_dict(torch.load(model_file))
+
+    # Wrap the model in a bounding box model
+    model_bb = models.BoundingBoxWildCatModel(model)
 
     # Generate a weighted sampler
     class_counts = np.array(list(map(lambda x: image_datasets['train'].targets.count(x), range(config['num_classes']))))
@@ -462,12 +586,12 @@ def do_train(arg):
     }
 
     # Map stuff to the device
-    model = model.to(device)
+    model_bb = model_bb.to(device)
     criterion = criterion.to(device)
 
     # Run the training
     model_ft, hist_val_run, hist_train_run = \
-        train_model(model, dataloaders_dict, criterion, optimizer,
+        train_model(model_bb, dataloaders_dict, criterion, optimizer,
                     num_epochs=config['wildcat_upsample']['num_epochs'])
 
     # Append the histories
@@ -475,7 +599,7 @@ def do_train(arg):
     hist_train.append(hist_train_run)
 
     # Save the model
-    torch.save(model_ft.state_dict(), model_file)
+    torch.save(model_ft.wildcat_model.state_dict(), model_file)
 
     # Add training history to saved config
     config['train_history'] = {
@@ -525,7 +649,9 @@ def do_val(arg):
     # Set global properties
     num_classes = config['num_classes']
     input_size = config['wildcat_upsample']['input_size']
-    batch_size = config['wildcat_upsample']['batch_size']
+
+    # Batch size should be input
+    batch_size = arg.batch
 
     # Create the model
     model_ft, _, _ = make_model(config)
@@ -534,17 +660,28 @@ def do_val(arg):
     model_ft.load_state_dict(
         torch.load(os.path.join(model_dir, "wildcat_upsample.dat")))
 
+    # Wrap the model as a bounding box model
+    model_bb = models.BoundingBoxWildCatModel(model_ft)
+
     # Send model to GPU
-    model_ft = model_ft.to(device)
-    model_ft.eval()
+    model_bb = model_bb.to(device)
+    model_bb.eval()
 
     # Create a data loader
     dt = transforms.Compose([
         transforms.CenterCrop(input_size),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        util.NormalizeRGB([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
-    ds = datasets.ImageFolder(os.path.join(data_dir, "test"), dt)
+
+    # Load the manifest if using bounding boxes
+    if config["wildcat_upsample"]["bounding_box"]:
+        bbox_manifest = pd.read_csv(arg.bbox) 
+        bbox_max = config['wildcat_upsample']['bounding_box_min_size']
+    else:
+        bbox_manifest = None
+        bbox_max = 0
+    
+    ds = util.ImageFolderWithBBox(os.path.join(data_dir, "test"), bbox_manifest, dt, bbox_max)
     dl = torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=4)
 
     # Create array of class names
@@ -560,7 +697,7 @@ def do_val(arg):
     with torch.no_grad():
         for mb, (img, label) in enumerate(dl):
             # Pass the images through the model
-            outputs = model_ft(img.to(device)).cpu()
+            outputs = model_bb(img.to(device)).cpu()
 
             # Get the predictions
             _, preds = torch.max(outputs, 1)
@@ -613,6 +750,7 @@ def do_val(arg):
         # Read a batch of data
         for j in range(10):
             img, label = next(iter(dl))
+            img = img[:,0:3,:,:]
             img_d = img.to(device)
 
             with torch.no_grad():
@@ -635,6 +773,7 @@ def do_val(arg):
     else:
         # Read a batch of data
         img, label = next(iter(dl))
+        img = img[:,0:3,:,:]
         img_d = img.to(device)
         plt.figure(figsize=(16, 16))
         show(torchvision.utils.make_grid(img, padding=10, nrow=8, normalize=True))
@@ -673,6 +812,14 @@ train_parser.add_argument('--kmax', help='WildCat k_max parameter', default=0.02
 train_parser.add_argument('--kmin', help='WildCat k_min parameter', default=0.0)
 train_parser.add_argument('--alpha', help='WildCat alpha parameter', default=0.7)
 train_parser.add_argument('--nmaps', help='WildCat number of maps parameter', default=4)
+train_parser.add_argument('--bbox', metavar='manifest.csv',
+                          help='Limit loss computation to user-drawn bounding boxes, specified in the manifest file')
+train_parser.add_argument('--bbox-min-size', type=int, default=0,
+                          help='Minimum bounding box size, default is 112')
+train_parser.add_argument('--random-crop', action='store_true',
+                          help='Randomly crop input patch instead of center cropping. Recommended with bbox')  
+train_parser.add_argument('--color-jitter', type=float, nargs=4, default=None,
+                          help='Whether to perform color jitter augmentation (see ColorJitter in torch)')                          
 train_parser.add_argument('--erasing', action='store_true',
                           help='Whether to perform erasing augmentation')
 train_parser.add_argument('--gmm', type=int, metavar='N', default=0,
@@ -684,6 +831,11 @@ train_parser.set_defaults(func=do_train)
 # Configure the validation parser
 val_parser = subparsers.add_parser('validate')
 val_parser.add_argument('--expdir', help='experiment directory')
+val_parser.add_argument('--bbox', metavar='manifest.csv',
+                        help='Limit loss computation to user-drawn bounding boxes, specified in the manifest file')
+val_parser.add_argument('--bbox-min-size', type=int, default=0,
+                        help='Minimum bounding box size, default is 112')
+val_parser.add_argument('--batch', help='batch size', default=16)                        
 val_parser.set_defaults(func=do_val)
 
 # Configure the apply parser
@@ -696,15 +848,26 @@ apply_parser.add_argument('--window', help='Size of the window for scanning', de
 apply_parser.add_argument('--shrink', help='How much to downsample WildCat output', default=4)
 apply_parser.set_defaults(func=do_apply)
 
+# Configure the patch apply parser
+patch_apply_parser = subparsers.add_parser('patch_apply')
+patch_apply_parser.add_argument('--input', help='Input directory containing patches to process')
+patch_apply_parser.add_argument('--modeldir', help='Directory containing the model')
+patch_apply_parser.add_argument('--output', help='Output file where to store density values')
+patch_apply_parser.add_argument('--outdir', help='Output directory where to store density maps (optional)')
+patch_apply_parser.add_argument('--outstat', help='Output file where to store density histograms (optional)')
+patch_apply_parser.add_argument('--shrink', help='How much to downsample WildCat output', default=4)
+patch_apply_parser.add_argument('--batch', help='Batch size', default=16, type=int)
+patch_apply_parser.add_argument('--scale',
+                                help='When applying to images of different resolution than '
+                                     'the training set, set this parameter to the ratio '
+                                     'test_pixel_size / train_pixel_size', default=1.0, type=float)
+patch_apply_parser.set_defaults(func=do_patch_apply)
+
 # Configure the info parser
 info_parser = subparsers.add_parser('info')
 info_parser.set_defaults(func=do_info)
 
 # Add common options to all subparsers
-for sp in (train_parser, val_parser, apply_parser):
-    sp.add_argument('--device', type=str, default='cuda:0', metavar='D',
-                    help='Set the PyTorch device to D, e.g., cuda:0 or cpu')
-
 if __name__ == '__main__':
     args = parser.parse_args()
     args.func(args)
