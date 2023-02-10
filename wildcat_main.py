@@ -270,6 +270,36 @@ def do_apply(args):
     sitk.WriteImage(nii, args.output)
 
 
+# Dataset for loading all images from a single directory
+class SimplePNGFolder(datasets.VisionDataset):
+
+    def __init__(self, root, transform):
+        super().__init__(root=root, transform=transform)
+        self.files = glob.glob(os.path.join(root, '*.png'))
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, index):
+        img = Image.open(self.files[index]).convert("RGB")
+        if self.transform:
+            img = self.transform(img)
+        return img, self.files[index]
+
+
+# Resize transform that takes a scaling factor
+class ResizeByFactor(torch.nn.Module):
+
+    def __init__(self, factor):
+        super().__init__()
+        self.factor = factor
+
+    def forward(self, patch):
+        size = int(patch.size[0] * self.factor),int(patch.size[1] * self.factor)
+        return torchvision.transforms.functional.resize(
+            patch, size, torchvision.transforms.InterpolationMode.BILINEAR)
+
+
 # Function to apply training to a collection of extracted patches
 def do_patch_apply(args):
 
@@ -298,73 +328,68 @@ def do_patch_apply(args):
     model_ft = model_ft.to(device)
     print("Model loaded to device")
 
-    # Find all the input files
-    allstat = {}
+    # Make sure the argument sizes match
+    file_args = list(zip(
+        args.input,
+        args.outstat if args.outstat is not None else [None] * len(args.input),
+        args.outdir if args.outdir is not None else [None] * len(args.input),
+        args.scale if args.scale is not None else [1.0] * len(args.input)))
 
-    # Read all filenames to process
-    fn_list = glob.glob(os.path.join(args.input, "*.png"))
-    if len(fn_list) == 0:
-        print('Missing input files')
-        return 255
-
-    # Split into mini-batch chunks
-    fn_list_fold = [fn_list[i:i+args.batch] for i in range(0, len(fn_list), args.batch)]
-
-    # Read the first patch to determine the patch size
-    patch = Image.open(fn_list[0]).convert("RGB")
-
-    # Set up the transformation
-    pw,ph = int(patch.size[0] * args.scale),int(patch.size[1] * args.scale)
-    tran = transforms.Compose([
-        transforms.Resize((pw,ph)),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-    ])
-
-    # Set up the minibatch storage
-    chunk_tensor = torch.zeros(args.batch, 3, pw, ph).to(device)
-
-    # Process data in minibatches
-    for ib, b in enumerate(fn_list_fold):
-        print('Batch {} of {}'.format(ib, len(fn_list_fold)))
+    # Iterate over input tuples
+    for (input, outstat, outdir, scale) in file_args:
         
-        # Load patches from images, transform, and stick into tensor
-        for ifn, fn in enumerate(b):
-            if ib > 0 and ifn > 0:
-                patch = Image.open(fn).convert("RGB")
-            chunk_tensor[ifn,:] = tran(patch).to(device)
+        # Create a transform
+        tran = transforms.Compose([
+            ResizeByFactor(scale),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ])
 
-        # Process minibatch through model
-        with torch.no_grad():
-            x_clas = model_ft.forward_to_classifier(chunk_tensor)
-            x_cpool = model_ft.spatial_pooling.class_wise(x_clas)
+        # Create a data set and data loader
+        ds = SimplePNGFolder(input, tran)
+        dl = torch.utils.data.DataLoader(ds, batch_size=args.batch, num_workers=4)
 
-        # Collect statistics
-        for ifn, fn in enumerate(b):
-            # Get statistics for each class 
+        # Find all the input files
+        allstat = {}
+    
+        # Set up the minibatch storage
+        # chunk_tensor = torch.zeros(args.batch, 3, pw, ph).to(device)
+
+        # Process data in batches
+        for ib, (img, paths) in enumerate(dl):
+            print('Directory {} Batch {} of {}'.format(input, ib, len(dl)))
+
+            # Process minibatch through model
+            with torch.no_grad():
+                x_clas = model_ft.forward_to_classifier(img.to(device))
+                x_cpool = model_ft.spatial_pooling.class_wise(x_clas)
+
             z = x_cpool.cpu().detach().numpy()
-            zstat = []
-            for k in range(num_classes):
-                zk = z[0,k,:,:].flatten()
-                zhist = np.histogram(zk, bins=np.linspace(-6.0, 6.0, 121), density=True)
-                zmean = np.mean(zk)
-                zstd = np.std(zk)
-                zstat.append({'histogram': zhist[0].tolist(), 'mean': zmean.item(), 'std': zstd.item()})
-            
-            # Append the statistics
-            allstat[os.path.basename(fn)] = zstat
 
-            # Write the image back to destination dir if requested
-            if args.outdir:
-                fn_dest = os.path.join(args.outdir, "wildcat_" + os.path.splitext(os.path.basename(fn))[0] + ".nii.gz")
-                dimg = x_cpool[0,:,:,:].cpu().numpy().transpose(1,2,0)
-                nii = sitk.GetImageFromArray(dimg, True)
-                sitk.WriteImage(nii, fn_dest)
+            # Collect statistics from the minibatch
+            for j in range(img.shape[0]):
+                zstat = []
+                for k in range(num_classes):
+                    zk = x_cpool[j,k,:,:].detach().cpu().numpy().flatten()
+                    zhist = np.histogram(zk, bins=np.linspace(-6.0, 6.0, 121), density=True)
+                    zmean = np.mean(zk)
+                    zstd = np.std(zk)
+                    zstat.append({'histogram': zhist[0].tolist(), 'mean': zmean.item(), 'std': zstd.item()})
+                
+                # Append the statistics
+                allstat[os.path.basename(paths[j])] = zstat
 
-    # Write the output JSON file, if requested
-    if args.outstat:
-        with open(args.outstat, "w") as f_outstat:
-            json.dump(allstat, f_outstat)
+                # Write the image back to destination dir if requested
+                if outdir:
+                    fn_dest = os.path.join(outdir, "wildcat_" + os.path.splitext(os.path.basename(paths[j]))[0] + ".nii.gz")
+                    dimg = x_cpool[j,:,:,:].cpu().numpy().transpose(1,2,0)
+                    nii = sitk.GetImageFromArray(dimg, True)
+                    sitk.WriteImage(nii, fn_dest)
+
+        # Write the output JSON file, if requested
+        if outstat:
+            with open(outstat, "w") as f_outstat:
+                json.dump(allstat, f_outstat)
 
 
 # Standard training code
@@ -850,17 +875,16 @@ apply_parser.set_defaults(func=do_apply)
 
 # Configure the patch apply parser
 patch_apply_parser = subparsers.add_parser('patch_apply')
-patch_apply_parser.add_argument('--input', help='Input directory containing patches to process')
+patch_apply_parser.add_argument('--input', help='Input directory containing patches to process', nargs='+')
 patch_apply_parser.add_argument('--modeldir', help='Directory containing the model')
-patch_apply_parser.add_argument('--output', help='Output file where to store density values')
-patch_apply_parser.add_argument('--outdir', help='Output directory where to store density maps (optional)')
-patch_apply_parser.add_argument('--outstat', help='Output file where to store density histograms (optional)')
+patch_apply_parser.add_argument('--outdir', help='Output directory where to store density maps (optional)', nargs='+')
+patch_apply_parser.add_argument('--outstat', help='Output file where to store density histograms (optional)', nargs='+')
 patch_apply_parser.add_argument('--shrink', help='How much to downsample WildCat output', default=4)
 patch_apply_parser.add_argument('--batch', help='Batch size', default=16, type=int)
 patch_apply_parser.add_argument('--scale',
                                 help='When applying to images of different resolution than '
                                      'the training set, set this parameter to the ratio '
-                                     'test_pixel_size / train_pixel_size', default=1.0, type=float)
+                                     'test_pixel_size / train_pixel_size', nargs='+', type=float)
 patch_apply_parser.set_defaults(func=do_patch_apply)
 
 # Configure the info parser
