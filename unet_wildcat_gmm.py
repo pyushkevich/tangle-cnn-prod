@@ -587,10 +587,13 @@ class UNet_WSL_GMM(nn.Module):
             self.gmm.append(GMMLayer())
             
         # Create the classwise pooling layer
-        self.classwise_pooling = ClassWisePool(mix_per_class)
+        ### self.classwise_pooling = ClassWisePool(mix_per_class)
         
         # Create the spatial pooling layer
-        self.spatial_pooling = WildcatPool2d(kmax, kmin, alpha)
+        ### self.spatial_pooling = WildcatPool2d(kmax, kmin, alpha)
+        self.spatial_pooling = nn.Sequential()
+        self.spatial_pooling.add_module('class_wise', ClassWisePool(mix_per_class))
+        self.spatial_pooling.add_module('spatial', WildcatPool2d(kmax, kmin, alpha))
         
         # image normalization
         self.image_normalization_mean = [0.485, 0.456, 0.406]

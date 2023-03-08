@@ -23,7 +23,7 @@ import traceback
 import matplotlib.pyplot as plt
 from osl_worker import osl_worker, osl_read_chunk_from_queue
 import wildcat_pytorch.wildcat as wildcat
-from wildcat_pytorch.picsl_wildcat import models, util
+from wildcat_pytorch.picsl_wildcat import models, util, losses
 from unet_wildcat_gmm import UNet_WSL_GMM
 from PIL import Image
 import pandas as pd
@@ -72,7 +72,13 @@ def make_model(config):
             num_maps=mcfg['num_maps'])
 
         # Loss and optimizer
-        criterion = nn.MultiLabelSoftMarginLoss()
+        if 'mlloss_weights' in mcfg:
+            w = torch.tensor(mcfg['mlloss_weights'], device=device)
+            criterion = losses.TanglethonLoss(w)
+        else:
+            criterion = losses.MultiLabelSoftMarginLoss()
+
+        # Initialize the optimizer
         optimizer = torch.optim.SGD(model.get_config_optim(0.01, 0.1), lr=0.01, momentum=0.9, weight_decay=1e-2)
 
     return model, criterion, optimizer
@@ -237,7 +243,7 @@ def do_apply(args):
 
     finally:
         worker.join(60)
-        if worker.isAlive():
+        if worker.is_alive():
             print('Thread worker failed to terminate after 60 seconds')
 
     # Set the spacing based on openslide
@@ -441,8 +447,7 @@ def train_model(model, dataloaders, criterion, optimizer, num_epochs=25):
                     #   but in testing we only consider the final output.
                     outputs = model(inputs)
                     loss = criterion(outputs, labels_one_hot)
-
-                    _, preds = torch.max(outputs, 1)
+                    preds = criterion.predictions(outputs)
 
                     # backward + optimize only if in training phase
                     if phase == 'train':
@@ -523,6 +528,11 @@ def do_train(arg):
             config["wildcat_upsample"]["bounding_box"] = True
             config["wildcat_upsample"]["bounding_box_min_size"] = arg.bbox_min_size if arg.bbox_min_size > 0 else 112
 
+        # Do we want to use a multi-label loss
+        if arg.mlloss is not None:
+            mlloss_spec = json.load(arg.mlloss)
+            config["wildcat_upsample"]["mlloss"] = mlloss_spec
+
         hist_train = []
         hist_val = []
 
@@ -577,6 +587,14 @@ def do_train(arg):
     # Get the class name to index mapping
     config['class_to_idx'] = image_datasets['train'].class_to_idx
     config['num_classes'] = len(image_datasets['train'].class_to_idx)
+
+    # Generate the matrix of weights for the TanglethonLoss
+    if mlloss_spec is not None:
+        mlloss_mat = np.zeros((config['num_classes'],config['num_classes']))
+        for (k1,v1) in config['class_to_idx'].items():
+            for (k2, v2) in config['class_to_idx'].items():
+                mlloss_mat[v1,v2] = mlloss_spec.get('{},{}'.format(k1,k2), 0.0)
+        config["wildcat_upsample"]["mlloss_weights"] = mlloss_mat.tolist()
 
     # Print the config
     print("Training configuration:")
@@ -679,7 +697,7 @@ def do_val(arg):
     batch_size = arg.batch
 
     # Create the model
-    model_ft, _, _ = make_model(config)
+    model_ft, criterion, _ = make_model(config)
 
     # Read model state
     model_ft.load_state_dict(
@@ -722,10 +740,10 @@ def do_val(arg):
     with torch.no_grad():
         for mb, (img, label) in enumerate(dl):
             # Pass the images through the model
-            outputs = model_bb(img.to(device)).cpu()
+            outputs = model_bb(img.to(device))
 
             # Get the predictions
-            _, preds = torch.max(outputs, 1)
+            preds = criterion.predictions(outputs).cpu()
 
             # Print minimatch stats
             print('MB %04d/%04d  corr %d' %
@@ -848,9 +866,21 @@ train_parser.add_argument('--color-jitter', type=float, nargs=4, default=None,
 train_parser.add_argument('--erasing', action='store_true',
                           help='Whether to perform erasing augmentation')
 train_parser.add_argument('--gmm', type=int, metavar='N', default=0,
-                          help='Use Gaussian Mixture Model network with N iterations of EM')
+                          help='Use Gaussian Mixture Model network with N iterations of EM. NOT RECOMMENDED.')
 train_parser.add_argument('--resume', action='store_true',
                           help='Resume training using previously saved parameters')
+train_parser.add_argument('--mlloss', type=argparse.FileType('r'), 
+                          help="""Use a multi-label loss with the weights specified in the JSON file.
+                                  The format of the weights should be 
+                                    {
+                                    "thread,tangle": 0.5,
+                                    "tangle,other": 1.0,
+                                    ...
+                                    }
+                                  where all non-zero entries in the weight matrix for the TanglethonLoss should
+                                  be included. The snipped above reads, "if the true label of a patch is
+                                  thread, the loss associated with labeling it as tangle is 0.5".
+                                """)
 train_parser.set_defaults(func=do_train)
 
 # Configure the validation parser
