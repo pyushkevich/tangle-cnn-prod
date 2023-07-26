@@ -427,7 +427,7 @@ def train_model(model, dataloaders, criterion, optimizer, num_epochs=25):
 
             # Iterate over data.
             nmb = len(dataloaders[phase])
-            for mb, (inputs, labels) in enumerate(dataloaders[phase]):
+            for mb, (inputs, labels, patch_ids) in enumerate(dataloaders[phase]):
                 inputs = inputs.to(device)
                 labels = labels.to(device)
                 labels_one_hot = torch.zeros([labels.shape[0], num_classes])
@@ -523,12 +523,22 @@ def do_train(arg):
             }
         }
 
+        # Check if the manifest is provided
+        if arg.bbox is True or arg.scale is not None:
+            if arg.manifest is None:
+                raise ValueError('Missing manifest parameter for bbox/scale options') 
+
         # Do we want bounding boxes
-        if arg.bbox is not None:
+        if arg.bbox is True:
             config["wildcat_upsample"]["bounding_box"] = True
             config["wildcat_upsample"]["bounding_box_min_size"] = arg.bbox_min_size if arg.bbox_min_size > 0 else 112
 
+        # Do we want scaling to target resolution
+        if arg.scale is not None:
+            config["wildcat_upsample"]["target_resolution"] = arg.scale
+
         # Do we want to use a multi-label loss
+        mlloss_spec=None
         if arg.mlloss is not None:
             mlloss_spec = json.load(arg.mlloss)
             config["wildcat_upsample"]["mlloss"] = mlloss_spec
@@ -576,13 +586,18 @@ def do_train(arg):
 
     # Create image datasets
     data_transforms = {k: transforms.Compose(v) for k, v in data_transform_lists.items()}
-    if config["wildcat_upsample"]["bounding_box"]:
-        bbox_manifest = pd.read_csv(arg.bbox) 
-        bbox_max = config['wildcat_upsample']['bounding_box_min_size']
-    else:
-        bbox_manifest = None
-        bbox_max = 0
-    image_datasets = {k: util.ImageFolderWithBBox(os.path.join(data_dir, k), bbox_manifest, v, bbox_max) for k, v in data_transforms.items()}
+
+    # Read the manifest
+    manifest = pd.read_csv(arg.manifest) if arg.manifest is not None else None
+
+    # Are we using bounding boxes?
+    use_bbox = config["wildcat_upsample"].get('bounding_box', False)
+    bbox_min = config['wildcat_upsample'].get('bounding_box_min_size', 0)
+    target_resolution = config["wildcat_upsample"].get('target_resolution', None)
+
+    image_datasets = {k: util.ImageFolderWithBBox(
+        os.path.join(data_dir, k), use_bbox, manifest, v, bbox_min, target_resolution) 
+        for k, v in data_transforms.items()}
 
     # Get the class name to index mapping
     config['class_to_idx'] = image_datasets['train'].class_to_idx
@@ -716,15 +731,17 @@ def do_val(arg):
         util.NormalizeRGB([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
 
+    # Read the manifest
+    manifest = pd.read_csv(arg.manifest) if arg.manifest is not None else None
+
     # Load the manifest if using bounding boxes
-    if config["wildcat_upsample"]["bounding_box"]:
-        bbox_manifest = pd.read_csv(arg.bbox) 
-        bbox_max = config['wildcat_upsample']['bounding_box_min_size']
-    else:
-        bbox_manifest = None
-        bbox_max = 0
+    use_bbox = config["wildcat_upsample"].get('bounding_box', False)
+    bbox_min = config['wildcat_upsample'].get('bounding_box_min_size', 0)
+    target_resolution = config["wildcat_upsample"].get('target_resolution', None)
     
-    ds = util.ImageFolderWithBBox(os.path.join(data_dir, "test"), bbox_manifest, dt, bbox_max)
+    ds = util.ImageFolderWithBBox(
+        os.path.join(data_dir, arg.target), use_bbox, manifest, dt, bbox_min, target_resolution)
+
     dl = torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=4)
 
     # Create array of class names
@@ -737,8 +754,11 @@ def do_val(arg):
     img_fp = [torch.empty(0)] * num_classes
     img_fn = [torch.empty(0)] * num_classes
 
+    # Keep track of what patch was assigned what class
+    all_patch_ids, all_patch_pred, all_patch_true = [], [], []
+
     with torch.no_grad():
-        for mb, (img, label) in enumerate(dl):
+        for mb, (img, label, patch_ids) in enumerate(dl):
             # Pass the images through the model
             outputs = model_bb(img.to(device))
 
@@ -754,6 +774,11 @@ def do_val(arg):
                 l_true = label[a].item()
                 cm[l_pred, l_true] = cm[l_pred, l_true] + 1
 
+                # Append predictions to list of all predictions
+                all_patch_ids.append(patch_ids[a])
+                all_patch_pred.append(l_pred)
+                all_patch_true.append(l_true) 
+
                 # Keep track of false positives and false negatives for each class
                 if l_pred != l_true:
                     img_a = img[a:a + 1, :, :, :]
@@ -761,7 +786,8 @@ def do_val(arg):
                     img_fn[l_true] = torch.cat((img_fn[l_true], img_a))
 
     # Path for the report
-    report_dir = os.path.join(exp_dir, 'test_model')
+    fld_name = 'test_model' if arg.target == 'test' else f'test_model_{arg.target}'
+    report_dir = os.path.join(exp_dir, fld_name)
     os.makedirs(report_dir, exist_ok=True)
 
     # JSon for the report
@@ -771,6 +797,10 @@ def do_val(arg):
         'class_accuracy': {k: 1 - (np.sum(cm[i, :]) + np.sum(cm[:, i]) - 2 * cm[i, i]) / np.sum(cm)
                            for k, i in config['class_to_idx'].items()}
     }
+
+    # Write individual patch predictions if requested
+    df_patch = pd.DataFrame({'sample': all_patch_ids, 'prediction': all_patch_pred, 'label': all_patch_true})
+    df_patch.to_csv(os.path.join(report_dir, 'patch_predictions.csv'), index=False)
 
     # Generate true and false positives
     for j in range(num_classes):
@@ -792,7 +822,7 @@ def do_val(arg):
 
         # Read a batch of data
         for j in range(10):
-            img, label = next(iter(dl))
+            img, label, patch_id = next(iter(dl))
             img = img[:,0:3,:,:]
             img_d = img.to(device)
 
@@ -815,15 +845,17 @@ def do_val(arg):
 
     else:
         # Read a batch of data
-        img, label = next(iter(dl))
-        img = img[:,0:3,:,:]
+        img_msk, label, patch_id = next(iter(dl))
+        img = img_msk[:,0:3,:,:]
         img_d = img.to(device)
         plt.figure(figsize=(16, 16))
-        show(torchvision.utils.make_grid(img, padding=10, nrow=8, normalize=True))
+        util.show_patches_with_masks(img_msk, labels=label, class_names=class_names)
+        # show(torchvision.utils.make_grid(img, padding=10, nrow=8, normalize=True))
         plt.savefig(os.path.join(report_dir, "example_patches.png"))
 
-        x_clas = model_ft.forward_to_classifier(img_d)
-        x_cpool = model_ft.spatial_pooling.class_wise(x_clas)
+        with torch.no_grad():
+            x_clas = model_ft.forward_to_classifier(img_d)
+            x_cpool = model_ft.spatial_pooling.class_wise(x_clas)
 
         # Generate burden maps for each class
         for mode in ('activation', 'softmax'):
@@ -831,7 +863,7 @@ def do_val(arg):
                 plt.figure(figsize=(20, 5))
                 plt.suptitle('Class %s %s' % (class_names[j], mode), fontsize=14)
                 for i in range(0, batch_size):
-                    plt.subplot(2, batch_size // 2, i + 1)
+                    plt.subplot(2, (batch_size+1) // 2, i + 1)
                     plt.title(class_names[label[i]])
                     activation = x_cpool[i, :, :, :].cpu().detach().numpy()
                     if mode == 'softmax':
@@ -850,17 +882,22 @@ subparsers = parser.add_subparsers()
 train_parser = subparsers.add_parser('train')
 train_parser.add_argument('--expdir', help='experiment directory')
 train_parser.add_argument('--epochs', help='number of epochs', default=50)
-train_parser.add_argument('--batch', help='batch size', default=16)
+train_parser.add_argument('--batch', help='batch size', default=16, type=int)
 train_parser.add_argument('--kmax', help='WildCat k_max parameter', default=0.02)
 train_parser.add_argument('--kmin', help='WildCat k_min parameter', default=0.0)
 train_parser.add_argument('--alpha', help='WildCat alpha parameter', default=0.7)
 train_parser.add_argument('--nmaps', help='WildCat number of maps parameter', default=4)
-train_parser.add_argument('--bbox', metavar='manifest.csv',
+train_parser.add_argument('--manifest', help='Manifest file for --bbox/--scale options')
+train_parser.add_argument('--bbox', action='store_true',
                           help='Limit loss computation to user-drawn bounding boxes, specified in the manifest file')
 train_parser.add_argument('--bbox-min-size', type=int, default=0,
                           help='Minimum bounding box size, default is 112')
 train_parser.add_argument('--random-crop', action='store_true',
                           help='Randomly crop input patch instead of center cropping. Recommended with bbox')  
+train_parser.add_argument('--scale', metavar='target_resolution', type=float, default=None,
+                          help="""Scale the patches to given physical resolution before processing, use when you have
+                                  slides with different resolution, manifest must include mpp_x and mpp_y columns.
+                                  Target resolution must be specified in mm per pixel""")
 train_parser.add_argument('--color-jitter', type=float, nargs=4, default=None,
                           help='Whether to perform color jitter augmentation (see ColorJitter in torch)')                          
 train_parser.add_argument('--erasing', action='store_true',
@@ -886,11 +923,10 @@ train_parser.set_defaults(func=do_train)
 # Configure the validation parser
 val_parser = subparsers.add_parser('validate')
 val_parser.add_argument('--expdir', help='experiment directory')
-val_parser.add_argument('--bbox', metavar='manifest.csv',
-                        help='Limit loss computation to user-drawn bounding boxes, specified in the manifest file')
-val_parser.add_argument('--bbox-min-size', type=int, default=0,
-                        help='Minimum bounding box size, default is 112')
-val_parser.add_argument('--batch', help='batch size', default=16)                        
+val_parser.add_argument('--manifest', metavar='manifest.csv',
+                        help='Manifest file needed if training was performed with --bbox or --scale')
+val_parser.add_argument('--batch', help='batch size', default=16, type=int)                       
+val_parser.add_argument('--target', help='which data to do evaluation on', default='test')                       
 val_parser.set_defaults(func=do_val)
 
 # Configure the apply parser
