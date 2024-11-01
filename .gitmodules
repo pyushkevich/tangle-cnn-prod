@@ -2,8 +2,8 @@
 	path = wildcat.pytorch
 	url = https://github.com/pyushkevich/wildcat.pytorch.git
 [submodule "deepcluster"]
-	path = deepcluster
+	path = tangle_cnn/deepcluster
 	url = https://github.com/facebookresearch/deepcluster
 [submodule "wildcat_pytorch"]
-	path = wildcat_pytorch
+	path = tangle_cnn/wildcat_pytorch
 	url = https://github.com/pyushkevich/wildcat.pytorch.git

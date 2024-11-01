@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-from __future__ import print_function
-from __future__ import division
 import torch
 import torch.nn as nn
 import numpy as np
@@ -84,196 +82,263 @@ def make_model(config):
     return model, criterion, optimizer
 
 
-# Function to apply training to a slide
-def do_apply(args):
+class TrainedWildcat:
+    
+    def __init__(self, modeldir):
+        
+        # Set the model directory
+        self.model_dir = modeldir
 
-    # Set the model directory
-    model_dir = args.modeldir
+        # Read the model's .json config file
+        with open(os.path.join(self.model_dir, 'config.json')) as json_file:
+            self.config = json.load(json_file)
 
-    # Read the model's .json config file
-    with open(os.path.join(model_dir, 'config.json')) as json_file:
-        config = json.load(json_file)
+        # Create the model
+        self.model_ft, _, _ = make_model(self.config)
 
-    # Create the model
-    model_ft, _, _ = make_model(config)
+        # Read model state
+        self.model_ft.load_state_dict(
+            torch.load(os.path.join(self.model_dir, "wildcat_upsample.dat")))
 
-    # Read model state
-    model_ft.load_state_dict(
-        torch.load(os.path.join(model_dir, "wildcat_upsample.dat")))
+        # Send model to GPU
+        self.model_ft.eval()
+        self.model_ft = self.model_ft.to(device)
+    
+    def apply(self, fn_slide, fn_output, window_size, extra_shrinkage, region=None):
+        """Apply Wildcat to a histology slide.
+        
+        Applies the trained Wildcat model to sliding windows passed over the histology
+        slide and generates a multi-component Nitfi image with Wildcat activation maps.
+        
+        Args:
+            fn_slide (str): Filename of a histology slide to analyze
+            fn_output (str): Filename where to save the output (ITK-writeable format)
+            window_size (int): Size of the window used to apply WildCat. 
+                Should be larger than the patch size used for training.
+            extra_shrinkage (int): Additional shrinkage factor to apply to output 
+                (because we don't want to store very large outputs)
+        """
+        
+        # Read the input using OpenSlide
+        osl = openslide.OpenSlide(fn_slide)
+        slide_dim = np.array(osl.dimensions)
 
-    # Send model to GPU
-    model_ft.eval()
-    model_ft = model_ft.to(device)
+        # Input size to WildCat (should be 224)
+        input_size_wildcat = self.config['wildcat_upsample']['input_size']
 
-    # Read the input using OpenSlide
-    osl = openslide.OpenSlide(args.slide)
-    slide_dim = np.array(osl.dimensions)
+        # Corresponding patch size in raw image (should match WildCat, no downsampling)
+        patch_size_raw = self.config['wildcat_upsample']['input_size']
+        window_size_raw = window_size
 
-    # Input size to WildCat (should be 224)
-    input_size_wildcat = config['wildcat_upsample']['input_size']
+        # The amount of padding, relative to patch size to add to the window. This padding
+        # is to provide context at the edges of the window
+        padding_size_rel = 1.0
+        padding_size_raw = int(padding_size_rel * patch_size_raw)
 
-    # Corresponding patch size in raw image (should match WildCat, no downsampling)
-    patch_size_raw = config['wildcat_upsample']['input_size']
+        # Factor by which wildcat shrinks input images when mapping to segmentations
+        wildcat_shrinkage = 2
 
-    # Size of the window used to apply WildCat. Should be larger than the patch size
-    # This does not include the padding
-    window_size_raw = int(args.window)
+        # Size of output pixel (in input pixels)
+        out_pix_size = wildcat_shrinkage * extra_shrinkage * patch_size_raw * 1.0 / input_size_wildcat
 
-    # The amount of padding, relative to patch size to add to the window. This padding
-    # is to provide context at the edges of the window
-    padding_size_rel = 1.0
-    padding_size_raw = int(padding_size_rel * patch_size_raw)
+        # The output size for each window
+        window_size_out = int(window_size_raw / out_pix_size)
 
-    # Factor by which wildcat shrinks input images when mapping to segmentations
-    wildcat_shrinkage = 2
+        # The padding size for the output
+        padding_size_out = int(padding_size_rel * patch_size_raw / out_pix_size)
 
-    # Additional shrinkage to apply to output (because we don't want to store very large)
-    # output images
-    extra_shrinkage = int(args.shrink)
+        # Total number of non-overlapping windows to process
+        n_win = np.ceil(slide_dim / window_size_raw).astype(int)
 
-    # Size of output pixel (in input pixels)
-    out_pix_size = wildcat_shrinkage * extra_shrinkage * patch_size_raw * 1.0 / input_size_wildcat
+        # Output image size 
+        out_dim = (n_win * window_size_out).astype(int)
 
-    # The output size for each window
-    window_size_out = int(window_size_raw / out_pix_size)
+        # Output array (last dimension is per-class probabilities)
+        num_classes = self.config['num_classes']
+        density = np.zeros((num_classes, out_dim[0], out_dim[1]))
 
-    # The padding size for the output
-    padding_size_out = int(padding_size_rel * patch_size_raw / out_pix_size)
+        # Range of pixels to scan
+        u_range, v_range = (0, n_win[0]), (0, n_win[1])
 
-    # Total number of non-overlapping windows to process
-    n_win = np.ceil(slide_dim / window_size_raw).astype(int)
+        # Allow a custom region to be specified
+        if region is not None and len(region) == 4:
+            region = list(float(val) for val in region)
+            if all(val < 1.0 for val in region):
+                u_range = (int(region[0] * n_win[0]), int((region[0] + region[2]) * n_win[0]))
+                v_range = (int(region[1] * n_win[1]), int((region[1] + region[3]) * n_win[1]))
+            else:
+                u_range = (int(region[0]), int(region[0] + region[2]))
+                v_range = (int(region[1]), int(region[1] + region[3]))
 
-    # Output image size 
-    out_dim = (n_win * window_size_out).astype(int)
+        print('Procesing region [%d %d] to [%d %d]' % (u_range[0], v_range[0], u_range[1], v_range[1]))
 
-    # Output array (last dimension is per-class probabilities)
-    num_classes = config['num_classes']
-    density = np.zeros((num_classes, out_dim[0], out_dim[1]))
+        # Set up a threaded worker to read openslide patches
+        worker = threading.Thread(target=osl_worker, args=(osl, u_range, v_range, window_size_raw, padding_size_raw))
+        worker.start()
 
-    # Range of pixels to scan
-    u_range, v_range = (0, n_win[0]), (0, n_win[1])
+        # Try/catch block to kill worker when done
+        t_00 = timeit.default_timer()
+        try:
 
-    # Allow a custom region to be specified
-    if args.region is not None and len(args.region) == 4:
-        region = list(float(val) for val in args.region)
-        if all(val < 1.0 for val in region):
-            u_range = (int(region[0] * n_win[0]), int((region[0] + region[2]) * n_win[0]))
-            v_range = (int(region[1] * n_win[1]), int((region[1] + region[3]) * n_win[1]))
-        else:
-            u_range = (int(region[0]), int(region[0] + region[2]))
-            v_range = (int(region[1]), int(region[1] + region[3]))
+            # Range non-overlapping windows
+            while True:
 
-    print('Procesing region [%d %d] to [%d %d]' % (u_range[0], v_range[0], u_range[1], v_range[1]))
+                # Read the chunk from the image
+                t0 = timeit.default_timer()
+                q_data = osl_read_chunk_from_queue()
+                t1 = timeit.default_timer()
 
-    # Set up a threaded worker to read openslide patches
-    worker = threading.Thread(target=osl_worker, args=(osl, u_range, v_range, window_size_raw, padding_size_raw))
-    worker.start()
+                # Check for sentinel value
+                if q_data is None:
+                    break
 
-    # Try/catch block to kill worker when done
-    t_00 = timeit.default_timer()
-    try:
+                # Get the values
+                ((u, v), (x, y, w), (xp, yp, wp), chunk_img) = q_data
 
-        # Range non-overlapping windows
-        while True:
+                # Compute the desired size of input to wildcat
+                wwc = int(wp * input_size_wildcat / patch_size_raw)
 
-            # Read the chunk from the image
-            t0 = timeit.default_timer()
-            q_data = osl_read_chunk_from_queue()
-            t1 = timeit.default_timer()
+                # Resample the chunk for the two networks
+                tran = transforms.Compose([
+                    transforms.Resize((wwc, wwc)),
+                    transforms.ToTensor(),
+                    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+                ])
 
-            # Check for sentinel value
-            if q_data is None:
-                break
+                # Convert the read chunk to tensor format
+                with torch.no_grad():
 
-            # Get the values
-            ((u, v), (x, y, w), (xp, yp, wp), chunk_img) = q_data
+                    # Apply transforms and turn into correct-size torch tensor
+                    chunk_tensor = torch.unsqueeze(tran(chunk_img), dim=0).to(device)
 
-            # Compute the desired size of input to wildcat
-            wwc = int(wp * input_size_wildcat / patch_size_raw)
+                    # Forward pass through the wildcat model
+                    x_clas = self.model_ft.forward_to_classifier(chunk_tensor)
+                    x_cpool = self.model_ft.spatial_pooling.class_wise(x_clas)
 
-            # Resample the chunk for the two networks
-            tran = transforms.Compose([
-                transforms.Resize((wwc, wwc)),
-                transforms.ToTensor(),
-                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-            ])
+                    # Scale the cpool image to desired size
+                    x_cpool_up = torch.nn.functional.interpolate(x_cpool,
+                                                                scale_factor=1.0 / extra_shrinkage).detach().cpu().numpy()
 
-            # Convert the read chunk to tensor format
+                    # Extract the central portion of the output
+                    p0, p1 = padding_size_out, (padding_size_out + window_size_out)
+                    x_cpool_ctr = x_cpool_up[:, :, p0:p1, p0:p1]
+
+                    # Stick it into the output array
+                    xout0, xout1 = u * window_size_out, ((u + 1) * window_size_out)
+                    yout0, yout1 = v * window_size_out, ((v + 1) * window_size_out)
+                    for j in range(num_classes):
+                        density[j, xout0:xout1, yout0:yout1] = x_cpool_ctr[0, j, :, :].transpose()
+
+                # Finished first pass through the chunk
+                t2 = timeit.default_timer()
+
+                # At this point we have a list of hits for this chunk
+                print("Chunk: (%6d,%6d) Times: IO=%6.4f WldC=%6.4f Totl=%8.4f" %
+                    (u, v, t1 - t0, t2 - t1, t2 - t0))
+
+            # Trim the density array to match size of input
+            out_dim_trim = np.round((slide_dim / out_pix_size)).astype(int)
+            density = density[:, 0:out_dim_trim[0], 0:out_dim_trim[1]]
+
+            # Report total time
+            t_11 = timeit.default_timer()
+            print("Total time elapsed: %8.4f" % (t_11 - t_00,))
+
+        except:
+            traceback.print_exc()
+            sys.exit(-1)
+
+        finally:
+            worker.join(60)
+            if worker.is_alive():
+                print('Thread worker failed to terminate after 60 seconds')
+
+        # Set the spacing based on openslide
+        # Get the image spacing from the header, in mm units
+        (sx, sy) = (0.0, 0.0)
+        if 'openslide.mpp-x' in osl.properties:
+            sx = float(osl.properties['openslide.mpp-x']) * out_pix_size / 1000.0
+            sy = float(osl.properties['openslide.mpp-y']) * out_pix_size / 1000.0
+        elif 'openslide.comment' in osl.properties:
+            for z in osl.properties['openslide.comment'].split('\n'):
+                r = parse.parse('Resolution = {} um', z)
+                if r is not None:
+                    sx = float(r[0]) * out_pix_size / 1000.0
+                    sy = float(r[0]) * out_pix_size / 1000.0
+
+        # If there is no spacing, throw exception
+        if sx == 0.0 or sy == 0.0:
+            raise Exception('No spacing information in image')
+
+        # Report spacing information
+        print("Spacing of the mri-like image: %gx%gmm\n" % (sx, sy))
+
+        # Write the result as a NIFTI file
+        nii_data = np.transpose(density, (2, 1, 0))
+        print('Output data shape: ', nii_data.shape)
+        nii = sitk.GetImageFromArray(nii_data, True)
+        print('Setting spacing to', (sx, sy))
+        nii.SetSpacing((sx, sy))
+        print("Density map will be saved to ", fn_output)
+        sitk.WriteImage(nii, fn_output)
+
+    # Function to apply training to a collection of extracted patches
+    def apply_to_patches(self, fn_input, fn_outdir, fn_outstat, scale, batch_size):
+
+        # Number of classes in the model
+        num_classes = self.config['num_classes']
+
+        # Create a transform
+        tran = transforms.Compose([
+            ResizeByFactor(scale),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ])
+
+        # Create a data set and data loader
+        ds = SimplePNGFolder(fn_input, tran)
+        dl = torch.utils.data.DataLoader(ds, batch_size=batch_size, num_workers=4)
+
+        # Find all the input files
+        allstat = {}
+    
+        # Process data in batches
+        for ib, (img, paths) in enumerate(dl):
+            print('Directory {} Batch {} of {}'.format(fn_input, ib, len(dl)))
+
+            # Process minibatch through model
             with torch.no_grad():
+                x_clas = self.model_ft.forward_to_classifier(img.to(device))
+                x_cpool = self.model_ft.spatial_pooling.class_wise(x_clas)
 
-                # Apply transforms and turn into correct-size torch tensor
-                chunk_tensor = torch.unsqueeze(tran(chunk_img), dim=0).to(device)
+            z = x_cpool.cpu().detach().numpy()
 
-                # Forward pass through the wildcat model
-                x_clas = model_ft.forward_to_classifier(chunk_tensor)
-                x_cpool = model_ft.spatial_pooling.class_wise(x_clas)
+            # Collect statistics from the minibatch
+            for j in range(img.shape[0]):
+                zstat = []
+                for k in range(num_classes):
+                    zk = x_cpool[j,k,:,:].detach().cpu().numpy().flatten()
+                    zhist = np.histogram(zk, bins=np.linspace(-6.0, 6.0, 121), density=True)
+                    zmean = np.mean(zk)
+                    zstd = np.std(zk)
+                    zstat.append({'histogram': zhist[0].tolist(), 'mean': zmean.item(), 'std': zstd.item()})
+                
+                # Append the statistics
+                allstat[os.path.basename(paths[j])] = zstat
 
-                # Scale the cpool image to desired size
-                x_cpool_up = torch.nn.functional.interpolate(x_cpool,
-                                                             scale_factor=1.0 / extra_shrinkage).detach().cpu().numpy()
+                # Write the image back to destination dir if requested
+                if fn_outdir:
+                    fn_dest = os.path.join(fn_outdir, "wildcat_" + os.path.splitext(os.path.basename(paths[j]))[0] + ".nii.gz")
+                    dimg = x_cpool[j,:,:,:].cpu().numpy().transpose(1,2,0)
+                    nii = sitk.GetImageFromArray(dimg, True)
+                    sitk.WriteImage(nii, fn_dest)
 
-                # Extract the central portion of the output
-                p0, p1 = padding_size_out, (padding_size_out + window_size_out)
-                x_cpool_ctr = x_cpool_up[:, :, p0:p1, p0:p1]
+        # Write the output JSON file, if requested
+        if fn_outstat:
+            with open(fn_outstat, "w") as f_outstat:
+                json.dump(allstat, f_outstat)
 
-                # Stick it into the output array
-                xout0, xout1 = u * window_size_out, ((u + 1) * window_size_out)
-                yout0, yout1 = v * window_size_out, ((v + 1) * window_size_out)
-                for j in range(num_classes):
-                    density[j, xout0:xout1, yout0:yout1] = x_cpool_ctr[0, j, :, :].transpose()
 
-            # Finished first pass through the chunk
-            t2 = timeit.default_timer()
-
-            # At this point we have a list of hits for this chunk
-            print("Chunk: (%6d,%6d) Times: IO=%6.4f WldC=%6.4f Totl=%8.4f" %
-                  (u, v, t1 - t0, t2 - t1, t2 - t0))
-
-        # Trim the density array to match size of input
-        out_dim_trim = np.round((slide_dim / out_pix_size)).astype(int)
-        density = density[:, 0:out_dim_trim[0], 0:out_dim_trim[1]]
-
-        # Report total time
-        t_11 = timeit.default_timer()
-        print("Total time elapsed: %8.4f" % (t_11 - t_00,))
-
-    except:
-        traceback.print_exc()
-        sys.exit(-1)
-
-    finally:
-        worker.join(60)
-        if worker.is_alive():
-            print('Thread worker failed to terminate after 60 seconds')
-
-    # Set the spacing based on openslide
-    # Get the image spacing from the header, in mm units
-    (sx, sy) = (0.0, 0.0)
-    if 'openslide.mpp-x' in osl.properties:
-        sx = float(osl.properties['openslide.mpp-x']) * out_pix_size / 1000.0
-        sy = float(osl.properties['openslide.mpp-y']) * out_pix_size / 1000.0
-    elif 'openslide.comment' in osl.properties:
-        for z in osl.properties['openslide.comment'].split('\n'):
-            r = parse.parse('Resolution = {} um', z)
-            if r is not None:
-                sx = float(r[0]) * out_pix_size / 1000.0
-                sy = float(r[0]) * out_pix_size / 1000.0
-
-    # If there is no spacing, throw exception
-    if sx == 0.0 or sy == 0.0:
-        raise Exception('No spacing information in image')
-
-    # Report spacing information
-    print("Spacing of the mri-like image: %gx%gmm\n" % (sx, sy))
-
-    # Write the result as a NIFTI file
-    nii_data = np.transpose(density, (2, 1, 0))
-    print('Output data shape: ', nii_data.shape)
-    nii = sitk.GetImageFromArray(nii_data, True)
-    print('Setting spacing to', (sx, sy))
-    nii.SetSpacing((sx, sy))
-    print("Density map will be saved to ", args.output)
-    sitk.WriteImage(nii, args.output)
 
 
 # Dataset for loading all images from a single directory
@@ -309,30 +374,8 @@ class ResizeByFactor(torch.nn.Module):
 # Function to apply training to a collection of extracted patches
 def do_patch_apply(args):
 
-    # Set the model directory
-    model_dir = args.modeldir
-
-    # Read the model's .json config file
-    with open(os.path.join(model_dir, 'config.json')) as json_file:
-        config = json.load(json_file)
-
-    # Number of classes in the model
-    num_classes = config['num_classes']
-
-    # Dict storing model statistics
-    d = { 'patches' : [], 'means': [], 'histograms': [] }
-
-    # Create the model
-    model_ft, _, _ = make_model(config)
-
-    # Read model state
-    model_ft.load_state_dict(
-        torch.load(os.path.join(model_dir, "wildcat_upsample.dat")))
-
-    # Send model to GPU
-    model_ft.eval()
-    model_ft = model_ft.to(device)
-    print("Model loaded to device")
+    # Create a wildcat instance    
+    wc = TrainedWildcat(args.modeldir)
 
     # Make sure the argument sizes match
     file_args = list(zip(
@@ -343,59 +386,7 @@ def do_patch_apply(args):
 
     # Iterate over input tuples
     for (input, outstat, outdir, scale) in file_args:
-        
-        # Create a transform
-        tran = transforms.Compose([
-            ResizeByFactor(scale),
-            transforms.ToTensor(),
-            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-        ])
-
-        # Create a data set and data loader
-        ds = SimplePNGFolder(input, tran)
-        dl = torch.utils.data.DataLoader(ds, batch_size=args.batch, num_workers=4)
-
-        # Find all the input files
-        allstat = {}
-    
-        # Set up the minibatch storage
-        # chunk_tensor = torch.zeros(args.batch, 3, pw, ph).to(device)
-
-        # Process data in batches
-        for ib, (img, paths) in enumerate(dl):
-            print('Directory {} Batch {} of {}'.format(input, ib, len(dl)))
-
-            # Process minibatch through model
-            with torch.no_grad():
-                x_clas = model_ft.forward_to_classifier(img.to(device))
-                x_cpool = model_ft.spatial_pooling.class_wise(x_clas)
-
-            z = x_cpool.cpu().detach().numpy()
-
-            # Collect statistics from the minibatch
-            for j in range(img.shape[0]):
-                zstat = []
-                for k in range(num_classes):
-                    zk = x_cpool[j,k,:,:].detach().cpu().numpy().flatten()
-                    zhist = np.histogram(zk, bins=np.linspace(-6.0, 6.0, 121), density=True)
-                    zmean = np.mean(zk)
-                    zstd = np.std(zk)
-                    zstat.append({'histogram': zhist[0].tolist(), 'mean': zmean.item(), 'std': zstd.item()})
-                
-                # Append the statistics
-                allstat[os.path.basename(paths[j])] = zstat
-
-                # Write the image back to destination dir if requested
-                if outdir:
-                    fn_dest = os.path.join(outdir, "wildcat_" + os.path.splitext(os.path.basename(paths[j]))[0] + ".nii.gz")
-                    dimg = x_cpool[j,:,:,:].cpu().numpy().transpose(1,2,0)
-                    nii = sitk.GetImageFromArray(dimg, True)
-                    sitk.WriteImage(nii, fn_dest)
-
-        # Write the output JSON file, if requested
-        if outstat:
-            with open(outstat, "w") as f_outstat:
-                json.dump(allstat, f_outstat)
+        wc.apply_to_patches(input, outdir, outstat, scale, args.batch)
 
 
 # Standard training code
@@ -874,6 +865,11 @@ def do_val(arg):
                 plt.savefig(os.path.join(report_dir, "example_%s_%s.png" % (class_names[j], mode)))
 
 
+# Function to apply training to a slide
+def do_apply(args):
+    wc = TrainedWildcat(args.modeldir)
+    wc.apply(args.slide, args.output, args.window, args.shrink, args.region)
+
 # Set up an argument parser
 parser = argparse.ArgumentParser()
 subparsers = parser.add_subparsers()
@@ -957,7 +953,8 @@ patch_apply_parser.set_defaults(func=do_patch_apply)
 info_parser = subparsers.add_parser('info')
 info_parser.set_defaults(func=do_info)
 
+
 # Add common options to all subparsers
-if __name__ == '__main__':
-    args = parser.parse_args()
-    args.func(args)
+#if __name__ == '__main__':
+#    args = parser.parse_args()
+#    args.func(args)

@@ -6,4 +6,5 @@ matplotlib
 openslide-python
 SimpleITK
 parse
+pandas
 Pillow
