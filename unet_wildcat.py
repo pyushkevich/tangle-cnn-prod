@@ -190,7 +190,7 @@ class ResNet18WSLUpsample(nn.Module):
 
 
 def resnet50_wildcat_upsample(num_classes, pretrained=True, kmax=1, kmin=None, alpha=1, num_maps=1):
-    model = models.resnet50(pretrained)
+    model = models.resnet50(weights=models.ResNet50_Weights.DEFAULT if pretrained else None)
     pooling = nn.Sequential()
     pooling.add_module('class_wise', ClassWisePool(num_maps))
     pooling.add_module('spatial', WildcatPool2d(kmax, kmin, alpha))
@@ -198,7 +198,7 @@ def resnet50_wildcat_upsample(num_classes, pretrained=True, kmax=1, kmin=None, a
 
 
 def resnet18_wildcat_upsample(num_classes, pretrained=True, kmax=1, kmin=None, alpha=1, num_maps=1):
-    model = models.resnet18(pretrained)
+    model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT if pretrained else None)
     pooling = nn.Sequential()
     pooling.add_module('class_wise', ClassWisePool(num_maps))
     pooling.add_module('spatial', WildcatPool2d(kmax, kmin, alpha))
