@@ -191,8 +191,9 @@ class TrainedWildcat:
         if region is not None and len(region) == 4:
             region = list(float(val) for val in region)
             if all(val <= 1.0 for val in region):
-                u_range = (int(region[0] * n_win[0]), int(np.ceil((region[0] + region[2]) * n_win[0])))
-                v_range = (int(region[1] * n_win[1]), int(np.ceil((region[1] + region[3]) * n_win[1])))
+                u_range, v_range = (
+                    (slide_dim[i] * region[i] // window_size_raw,
+                     1 + slide_dim[i] * (region[i] + region[i+2]) // window_size_raw) for i in range(2))
             else:
                 u_range = (int(region[0]), int(region[0] + region[2]))
                 v_range = (int(region[1]), int(region[1] + region[3]))
