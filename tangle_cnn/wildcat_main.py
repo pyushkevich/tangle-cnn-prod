@@ -19,10 +19,10 @@ import parse
 import glob
 import traceback
 import matplotlib.pyplot as plt
-from osl_worker import osl_worker, osl_read_chunk_from_queue
-import wildcat_pytorch.wildcat as wildcat
-from wildcat_pytorch.picsl_wildcat import models, util, losses
-from unet_wildcat_gmm import UNet_WSL_GMM
+from .osl_worker import osl_worker, osl_read_chunk_from_queue
+from .osl_worker import HistologyDataSource, OpenSlideHistologyDataSource, SimpleITKHistologyDataSource
+from .wildcat_pytorch.picsl_wildcat import models, util, losses
+from .unet_wildcat_gmm import UNet_WSL_GMM
 from PIL import Image
 import pandas as pd
 
@@ -40,12 +40,12 @@ def read_openslide_chunk(osl, pos, level, size):
     chunk_img = osl.read_region(pos, level, size).convert("RGB")
 
 
-def make_model(config):
+def make_model(config, pretrained=True):
     """Instantiate a model, loss, and optimizer based on the config dict"""
     mcfg = config['wildcat_upsample']
 
     # Instantiate WildCat model, loss and optiizer
-    if mcfg['gmm'] > 0:
+    if 'gmm' in mcfg and mcfg['gmm'] > 0:
         model = UNet_WSL_GMM(
             num_classes=config['num_classes'],
             mix_per_class=mcfg['num_maps'],
@@ -58,7 +58,8 @@ def make_model(config):
         # We use BCE loss because network outputs are probabilities, and this loss
         # does log clamping to prevent infinity or NaN in the gradients
         criterion = torch.nn.BCELoss()
-        optimizer = torch.optim.SGD(model.parameters(), lr=0.001, momentum=0.9, weight_decay=1e-2)
+        lr = mcfg.get('lr', 0.001)
+        optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=1e-2)
 
     else:
         model = models.resnet50_wildcat_upsample(
@@ -77,58 +78,78 @@ def make_model(config):
             criterion = losses.MultiLabelSoftMarginLoss()
 
         # Initialize the optimizer
-        optimizer = torch.optim.SGD(model.get_config_optim(0.01, 0.1), lr=0.01, momentum=0.9, weight_decay=1e-2)
+        lr = mcfg.get('lr', 0.01)
+        optimizer = torch.optim.SGD(model.get_config_optim(lr, 0.1), lr=lr, momentum=0.9, weight_decay=1e-2)
 
     return model, criterion, optimizer
 
-
 class TrainedWildcat:
     
-    def __init__(self, modeldir):
+    def __init__(self, modeldir, device=None):
         
         # Set the model directory
         self.model_dir = modeldir
+        self.device = torch.get_default_device() if device is None else device
 
         # Read the model's .json config file
         with open(os.path.join(self.model_dir, 'config.json')) as json_file:
             self.config = json.load(json_file)
-
+        
         # Create the model
-        self.model_ft, _, _ = make_model(self.config)
+        self.model_ft, _, _ = make_model(self.config, pretrained=False)
 
         # Read model state
         self.model_ft.load_state_dict(
-            torch.load(os.path.join(self.model_dir, "wildcat_upsample.dat")))
+            torch.load(os.path.join(self.model_dir, "wildcat_upsample.dat"),
+                       weights_only=True, map_location=self.device))
 
         # Send model to GPU
         self.model_ft.eval()
-        self.model_ft = self.model_ft.to(device)
+        self.model_ft = self.model_ft.to(self.device)
+        
+    @property
+    def suffix(self):
+        return self.config['suffix']
     
-    def apply(self, fn_slide, fn_output, window_size, extra_shrinkage, region=None):
+    def apply(self, osl:HistologyDataSource, 
+              window_size:int, extra_shrinkage:int=0, 
+              region=None, target_resolution=None):
         """Apply Wildcat to a histology slide.
         
         Applies the trained Wildcat model to sliding windows passed over the histology
         slide and generates a multi-component Nitfi image with Wildcat activation maps.
         
         Args:
-            fn_slide (str): Filename of a histology slide to analyze
-            fn_output (str): Filename where to save the output (ITK-writeable format)
+            osl (HistologyDataSource): Object from which histology will be sampled. Can be
+                ``OpenSlideHistologyDataSource`` or ``SimpleITKHistologyDataSource``
             window_size (int): Size of the window used to apply WildCat. 
                 Should be larger than the patch size used for training.
-            extra_shrinkage (int): Additional shrinkage factor to apply to output 
+            extra_shrinkage (int, optional): Additional shrinkage factor to apply to output 
                 (because we don't want to store very large outputs)
+            region (list of float or int, optional): Restrict the extraction to a region, specified in the
+                format [x,y,w,h]. If all four numbers are in range [0, 1], the region specification is
+                relative to the image size. If not, the region specification is in units of windows.
+            target_resolution (float, optional): Target spacing to which the input data should be 
+                resampled before performing inference. This should be used when the spacing 
+                (resolution) of the slide is different from the resolution on which the model
+                was trained.
+        Returns:
+            Density image as `SimpleITK.Image`. The density image is a multichannel 2D image in
+            which every pixel stores the posterior probability of each tissue class.
         """
         
         # Read the input using OpenSlide
-        osl = openslide.OpenSlide(fn_slide)
         slide_dim = np.array(osl.dimensions)
 
         # Input size to WildCat (should be 224)
         input_size_wildcat = self.config['wildcat_upsample']['input_size']
+        
+        # Corresponding patch size in the histology image
+        res_factor = 1 if target_resolution is None else input_size_wildcat * osl.spacing[0]
+        patch_size_raw = int(0.5 + input_size_wildcat * res_factor)
 
         # Corresponding patch size in raw image (should match WildCat, no downsampling)
-        patch_size_raw = self.config['wildcat_upsample']['input_size']
-        window_size_raw = window_size
+        window_size_raw = int(0.5 + window_size * res_factor)
 
         # The amount of padding, relative to patch size to add to the window. This padding
         # is to provide context at the edges of the window
@@ -163,7 +184,7 @@ class TrainedWildcat:
         # Allow a custom region to be specified
         if region is not None and len(region) == 4:
             region = list(float(val) for val in region)
-            if all(val < 1.0 for val in region):
+            if all(val <= 1.0 for val in region):
                 u_range = (int(region[0] * n_win[0]), int((region[0] + region[2]) * n_win[0]))
                 v_range = (int(region[1] * n_win[1]), int((region[1] + region[3]) * n_win[1]))
             else:
@@ -254,34 +275,21 @@ class TrainedWildcat:
                 print('Thread worker failed to terminate after 60 seconds')
 
         # Set the spacing based on openslide
-        # Get the image spacing from the header, in mm units
-        (sx, sy) = (0.0, 0.0)
-        if 'openslide.mpp-x' in osl.properties:
-            sx = float(osl.properties['openslide.mpp-x']) * out_pix_size / 1000.0
-            sy = float(osl.properties['openslide.mpp-y']) * out_pix_size / 1000.0
-        elif 'openslide.comment' in osl.properties:
-            for z in osl.properties['openslide.comment'].split('\n'):
-                r = parse.parse('Resolution = {} um', z)
-                if r is not None:
-                    sx = float(r[0]) * out_pix_size / 1000.0
-                    sy = float(r[0]) * out_pix_size / 1000.0
-
-        # If there is no spacing, throw exception
-        if sx == 0.0 or sy == 0.0:
-            raise Exception('No spacing information in image')
-
-        # Report spacing information
-        print("Spacing of the mri-like image: %gx%gmm\n" % (sx, sy))
-
+        # Get the image spacing from the header, in mm units        
+        sx, sy = (osl.spacing * out_pix_size).tolist()
+        print("Spacing of the density image: %gx%gmm\n" % (sx, sy))
+        
         # Write the result as a NIFTI file
         nii_data = np.transpose(density, (2, 1, 0))
         print('Output data shape: ', nii_data.shape)
         nii = sitk.GetImageFromArray(nii_data, True)
         print('Setting spacing to', (sx, sy))
         nii.SetSpacing((sx, sy))
-        print("Density map will be saved to ", fn_output)
-        sitk.WriteImage(nii, fn_output)
-
+        # Set the origin to that the corner of the first pixel is 0, 0
+        nii.SetOrigin((sx/2,sy/2))
+        
+        return nii
+        
     # Function to apply training to a collection of extracted patches
     def apply_to_patches(self, fn_input, fn_outdir, fn_outstat, scale, batch_size):
 
@@ -337,8 +345,6 @@ class TrainedWildcat:
         if fn_outstat:
             with open(fn_outstat, "w") as f_outstat:
                 json.dump(allstat, f_outstat)
-
-
 
 
 # Dataset for loading all images from a single directory
@@ -443,7 +449,18 @@ def train_model(model, dataloaders, criterion, optimizer, num_epochs=25):
                     # backward + optimize only if in training phase
                     if phase == 'train':
                         loss.backward()
-                        optimizer.step()
+
+                        for param in optimizer.param_groups[0]['params']:
+                            if param.grad is not None:
+                                valid_gradients = not (torch.isnan(param.grad).any())
+                                if not valid_gradients:
+                                    break
+
+                        if not valid_gradients:
+                            print("detected inf or nan values in gradients. not updating model parameters")
+                            optimizer.zero_grad()
+                        else:
+                            optimizer.step()
 
                 # Print minimatch stats
                 print('MB %04d/%04d  loss %f  corr %d' %
@@ -510,7 +527,8 @@ def do_train(arg):
                 "input_size": 224,
                 "num_epochs": int(arg.epochs),
                 "batch_size": int(arg.batch),
-                "gmm": arg.gmm
+                "gmm": arg.gmm,
+                "lr": arg.lr
             }
         }
 
@@ -607,11 +625,11 @@ def do_train(arg):
     print(config)
 
     # Instantiate WildCat model, loss and optiizer
-    model, criterion, optimizer = make_model(config)
+    model, criterion, optimizer = make_model(config, pretrained=True)
 
     # Load the model if resuming
     if bool(arg.resume) is True:
-        model.load_state_dict(torch.load(model_file))
+        model.load_state_dict(torch.load(model_file, weights_only=True))
 
     # Wrap the model in a bounding box model
     model_bb = models.BoundingBoxWildCatModel(model)
@@ -668,7 +686,7 @@ def show(img):
 
 
 # Function to plot false positives or negatives
-def plot_error(img, j, err_type, class_names, cm):
+def plot_error_old(img, j, err_type, class_names, cm):
     num_fp = img[j].shape[0]
     sub_fp = np.random.choice(num_fp, min(14, num_fp), replace=False)
     if num_fp > 0:
@@ -679,6 +697,34 @@ def plot_error(img, j, err_type, class_names, cm):
     marginal = cm[j, :] if err_type == 'positives' else cm[:, j]
     plt.title("Examples of false %s for %s: (%d out of %d patches)" %
               (err_type, class_names[j], sum(marginal) - marginal[j], sum(marginal)))
+
+
+def plot_error(d_err, j, err_type, class_names, cm):
+    num_err = len(d_err[j])
+    sub_err = np.random.choice(num_err, min(16, num_err), replace=False)
+    fig, axes = plt.subplots(4, 4, figsize=(16,16))
+    for p, ax in enumerate(axes.flat):
+        if p < len(sub_err):
+            i = sub_err[p]
+            patch = d_err[j][i]['patch']
+            nm_true = class_names[d_err[j][i]['true']]
+            nm_pred = class_names[d_err[j][i]['pred']]
+            ax.imshow((patch[:,:,0:3] + 2.2) / 5)
+            if patch.shape[2] > 3:
+                ax.imshow(patch[:,:,-1], alpha = 0.2, vmin=0, vmax=1)
+            ax.set_axis_off()
+            ax.set_title(f'Y="{nm_pred}", T="{nm_true}"')
+        else:
+            ax.set_axis_off()
+
+    # Report statistics
+    (marginal, nm_rate) = (cm[j, :],'FPR') if err_type == 'positives' else (cm[:, j], 'FNR')
+    s_marginal = sum(marginal)
+    n_err = sum(marginal) - marginal[j]
+    err_rate = n_err / s_marginal
+    fig.suptitle('Examples of false %s for class "%s". %s = %6.4f (%d / %d)' %
+                 (err_type, class_names[j], nm_rate, err_rate, n_err, s_marginal))
+    return fig
 
 
 def do_val(arg):
@@ -703,11 +749,11 @@ def do_val(arg):
     batch_size = arg.batch
 
     # Create the model
-    model_ft, criterion, _ = make_model(config)
+    model_ft, criterion, _ = make_model(config, pretrained=False)
 
     # Read model state
     model_ft.load_state_dict(
-        torch.load(os.path.join(model_dir, "wildcat_upsample.dat")))
+        torch.load(os.path.join(model_dir, "wildcat_upsample.dat"), weights_only=True))
 
     # Wrap the model as a bounding box model
     model_bb = models.BoundingBoxWildCatModel(model_ft)
@@ -742,9 +788,12 @@ def do_val(arg):
 
     # Perform full test set evaluation and save examples of errors
     cm = np.zeros((num_classes, num_classes))
-    img_fp = [torch.empty(0)] * num_classes
-    img_fn = [torch.empty(0)] * num_classes
-
+    
+    # False positive and false negative arrays are lists of dicts, each
+    # dict stores an image patch, mask if available, patch id, etc.
+    d_fp = list([ [] for k in range(num_classes) ])
+    d_fn = list([ [] for k in range(num_classes) ])
+    
     # Keep track of what patch was assigned what class
     all_patch_ids, all_patch_pred, all_patch_true = [], [], []
 
@@ -772,9 +821,14 @@ def do_val(arg):
 
                 # Keep track of false positives and false negatives for each class
                 if l_pred != l_true:
-                    img_a = img[a:a + 1, :, :, :]
-                    img_fp[l_pred] = torch.cat((img_fp[l_pred], img_a))
-                    img_fn[l_true] = torch.cat((img_fn[l_true], img_a))
+                    err = {
+                        'id': patch_ids[a],
+                        'patch': img[a, :, :, :].permute(1,2,0).detach().cpu().numpy(),
+                        'true': l_true,
+                        'pred': l_pred
+                    }
+                    d_fp[l_pred].append(err)
+                    d_fn[l_true].append(err)
 
     # Path for the report
     fld_name = 'test_model' if arg.target == 'test' else f'test_model_{arg.target}'
@@ -795,12 +849,14 @@ def do_val(arg):
 
     # Generate true and false positives
     for j in range(num_classes):
-        plot_error(img_fp, j, 'positives', class_names, cm)
-        plt.savefig(os.path.join(report_dir, "false_positives_%s.png" % (class_names[j],)))
+        fig = plot_error(d_fp, j, 'positives', class_names, cm)
+        fig.savefig(os.path.join(report_dir, "false_positives_%s.png" % (class_names[j],)))
+        plt.close(fig)
 
     for j in range(num_classes):
-        plot_error(img_fn, j, 'negatives', class_names, cm)
-        plt.savefig(os.path.join(report_dir, "false_negatives_%s.png" % (class_names[j],)))
+        fig = plot_error(d_fn, j, 'negatives', class_names, cm)
+        fig.savefig(os.path.join(report_dir, "false_negatives_%s.png" % (class_names[j],)))
+        plt.close(fig)
 
     # Save the report
     with open(os.path.join(report_dir, 'stats.json'), 'w') as jfile:
@@ -868,7 +924,17 @@ def do_val(arg):
 # Function to apply training to a slide
 def do_apply(args):
     wc = TrainedWildcat(args.modeldir)
-    wc.apply(args.slide, args.output, args.window, args.shrink, args.region)
+    if args.reader == 'osl':
+        osl = openslide.OpenSlide(args.slide)
+        datasource = OpenSlideHistologyDataSource(args.slide)
+    elif args.reader == 'sitk':
+        img = sitk.ReadImage(args.slide)
+        datasource = SimpleITKHistologyDataSource(img)
+    else:
+        raise ValueError(f'Unsupported reader {args.reader}')
+    
+    nii = wc.apply(datasource, args.window, args.shrink, args.region)
+    sitk.WriteImage(nii, args.output)
 
 # Set up an argument parser
 parser = argparse.ArgumentParser()
@@ -914,6 +980,7 @@ train_parser.add_argument('--mlloss', type=argparse.FileType('r'),
                                   be included. The snipped above reads, "if the true label of a patch is
                                   thread, the loss associated with labeling it as tangle is 0.5".
                                 """)
+train_parser.add_argument('--lr', help='Learning rate, default 0.01 (0.001 for GMM)', default=None, type=float)
 train_parser.set_defaults(func=do_train)
 
 # Configure the validation parser
@@ -928,11 +995,13 @@ val_parser.set_defaults(func=do_val)
 # Configure the apply parser
 apply_parser = subparsers.add_parser('apply')
 apply_parser.add_argument('--slide', help='Input histology slide to process')
+apply_parser.add_argument('--reader', choices=['openslide', 'pillow', 'sitk'], help='Reader to use for the slide', default='openslide')
 apply_parser.add_argument('--modeldir', help='Directory containing the model')
 apply_parser.add_argument('--output', help='Where to store the output density map')
 apply_parser.add_argument('--region', help='Region of image to process (x,y,w,h)', nargs=4)
 apply_parser.add_argument('--window', help='Size of the window for scanning', default=4096)
 apply_parser.add_argument('--shrink', help='How much to downsample WildCat output', default=4)
+apply_parser.add_argument('--manifest', type=str, help='Read input and output data from a manifest .csv file, columns must include slide,output')
 apply_parser.set_defaults(func=do_apply)
 
 # Configure the patch apply parser
