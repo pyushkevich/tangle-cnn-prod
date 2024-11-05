@@ -116,7 +116,7 @@ class TrainedWildcat:
     
     def apply(self, osl:HistologyDataSource, 
               window_size:int, extra_shrinkage:int=0, 
-              region=None, target_resolution=None):
+              region=None, target_resolution=None, crop=False):
         """Apply Wildcat to a histology slide.
         
         Applies the trained Wildcat model to sliding windows passed over the histology
@@ -136,6 +136,9 @@ class TrainedWildcat:
                 resampled before performing inference. This should be used when the spacing 
                 (resolution) of the slide is different from the resolution on which the model
                 was trained.
+            crop (bool, optional): If True, the output image will be cropped to the region processed. 
+                Otherwise, the density image corresponding to the whole slide is returned. Has no effect
+                if region is None. Default: False.
         Returns:
             Density image as `SimpleITK.Image`. The density image is a multichannel 2D image in
             which every pixel stores the posterior probability of each tissue class.
@@ -188,8 +191,8 @@ class TrainedWildcat:
         if region is not None and len(region) == 4:
             region = list(float(val) for val in region)
             if all(val <= 1.0 for val in region):
-                u_range = (int(region[0] * n_win[0]), int((region[0] + region[2]) * n_win[0]))
-                v_range = (int(region[1] * n_win[1]), int((region[1] + region[3]) * n_win[1]))
+                u_range = (int(region[0] * n_win[0]), int(np.ceil((region[0] + region[2]) * n_win[0])))
+                v_range = (int(region[1] * n_win[1]), int(np.ceil((region[1] + region[3]) * n_win[1])))
             else:
                 u_range = (int(region[0]), int(region[0] + region[2]))
                 v_range = (int(region[1]), int(region[1] + region[3]))
@@ -199,7 +202,7 @@ class TrainedWildcat:
         # Set up a threaded worker to read openslide patches
         worker = threading.Thread(target=osl_worker, args=(osl, u_range, v_range, window_size_raw, padding_size_raw))
         worker.start()
-
+        
         # Try/catch block to kill worker when done
         t_00 = timeit.default_timer()
         try:
@@ -252,17 +255,13 @@ class TrainedWildcat:
                     yout0, yout1 = v * window_size_out, ((v + 1) * window_size_out)
                     for j in range(num_classes):
                         density[j, xout0:xout1, yout0:yout1] = x_cpool_ctr[0, j, :, :].transpose()
-
+                        
                 # Finished first pass through the chunk
                 t2 = timeit.default_timer()
 
                 # At this point we have a list of hits for this chunk
                 print("Chunk: (%6d,%6d) Times: IO=%6.4f WldC=%6.4f Totl=%8.4f" %
                     (u, v, t1 - t0, t2 - t1, t2 - t0))
-
-            # Trim the density array to match size of input
-            out_dim_trim = np.round((slide_dim / out_pix_size)).astype(int)
-            density = density[:, 0:out_dim_trim[0], 0:out_dim_trim[1]]
 
             # Report total time
             t_11 = timeit.default_timer()
@@ -277,20 +276,23 @@ class TrainedWildcat:
             if worker.is_alive():
                 print('Thread worker failed to terminate after 60 seconds')
 
-        # Set the spacing based on openslide
-        # Get the image spacing from the header, in mm units        
+        # Crop the density image either to the whole image size or to the size of the
+        # region processed
+        out_dim_trim = np.round((slide_dim / out_pix_size)).astype(int)
+        d_x0 = u_range[0] * window_size_out if crop else 0
+        d_x1 = min(out_dim_trim[0], u_range[1] * window_size_out) if crop else out_dim_trim[0]
+        d_y0 = v_range[0] * window_size_out if crop else 0
+        d_y1 = min(out_dim_trim[1], v_range[1] * window_size_out) if crop else out_dim_trim[1]
+
+        # Extract the desired region of the density image and convert to ITK image
+        density = density[:, d_x0:d_x1, d_y0:d_y1]
+        nii = sitk.GetImageFromArray(np.transpose(density, (2, 1, 0)), isVector=True)
+        
+        # Set the spacing based on openslide        
         sx, sy = (osl.spacing * out_pix_size).tolist()
-        print("Spacing of the density image: %gx%gmm\n" % (sx, sy))
-        
-        # Write the result as a NIFTI file
-        nii_data = np.transpose(density, (2, 1, 0))
-        print('Output data shape: ', nii_data.shape)
-        nii = sitk.GetImageFromArray(nii_data, True)
-        print('Setting spacing to', (sx, sy))
         nii.SetSpacing((sx, sy))
-        # Set the origin to that the corner of the first pixel is 0, 0
-        nii.SetOrigin((sx/2,sy/2))
-        
+        nii.SetOrigin(((d_x0+0.5) * sx, (d_y0+0.5) * sy))
+
         return nii
         
     # Function to apply training to a collection of extracted patches
