@@ -148,7 +148,7 @@ class TrainedWildcat:
         input_size_wildcat = self.config['wildcat_upsample']['input_size']
         
         # Corresponding patch size in the histology image
-        res_factor = 1 if target_resolution is None else input_size_wildcat * osl.spacing[0]
+        res_factor = 1 if target_resolution is None else target_resolution / osl.spacing[0]
         patch_size_raw = int(0.5 + input_size_wildcat * res_factor)
 
         # Corresponding patch size in raw image (should match WildCat, no downsampling)
