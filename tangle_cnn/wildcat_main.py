@@ -89,7 +89,10 @@ class TrainedWildcat:
         
         # Set the model directory
         self.model_dir = modeldir
-        self.device = torch.get_default_device() if device is None else device
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = device
+        print(f'TrainedWildcat {modeldir} on device {self.device}')
 
         # Read the model's .json config file
         with open(os.path.join(self.model_dir, 'config.json')) as json_file:
@@ -230,7 +233,7 @@ class TrainedWildcat:
                 with torch.no_grad():
 
                     # Apply transforms and turn into correct-size torch tensor
-                    chunk_tensor = torch.unsqueeze(tran(chunk_img), dim=0).to(device)
+                    chunk_tensor = torch.unsqueeze(tran(chunk_img), dim=0).to(self.device)
 
                     # Forward pass through the wildcat model
                     x_clas = self.model_ft.forward_to_classifier(chunk_tensor)
@@ -316,7 +319,7 @@ class TrainedWildcat:
 
             # Process minibatch through model
             with torch.no_grad():
-                x_clas = self.model_ft.forward_to_classifier(img.to(device))
+                x_clas = self.model_ft.forward_to_classifier(img.to(self.device))
                 x_cpool = self.model_ft.spatial_pooling.class_wise(x_clas)
 
             z = x_cpool.cpu().detach().numpy()
