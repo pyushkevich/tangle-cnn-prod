@@ -116,7 +116,7 @@ class TrainedWildcat:
     
     def apply(self, osl:HistologyDataSource, 
               window_size:int, extra_shrinkage:int=0, 
-              region=None, target_resolution=None, crop=False):
+              region=None, target_resolution=None, crop=False, add_rgb_to_density=False):
         """Apply Wildcat to a histology slide.
         
         Applies the trained Wildcat model to sliding windows passed over the histology
@@ -139,6 +139,9 @@ class TrainedWildcat:
             crop (bool, optional): If True, the output image will be cropped to the region processed. 
                 Otherwise, the density image corresponding to the whole slide is returned. Has no effect
                 if region is None. Default: False.
+            add_rgb_to_density (bool, optional): If True, the downsampled input channels are appended to 
+                the density output as additional channels. Use this if you want to save an image of the
+                same size as the density image that contains the input to the network. Default: false
         Returns:
             Density image as `SimpleITK.Image`. The density image is a multichannel 2D image in
             which every pixel stores the posterior probability of each tissue class.
@@ -147,32 +150,35 @@ class TrainedWildcat:
         # Read the input using OpenSlide
         slide_dim = np.array(osl.dimensions)
 
-        # Input size to WildCat (should be 224)
-        input_size_wildcat = self.config['wildcat_upsample']['input_size']
-        
-        # Corresponding patch size in the histology image
+        # Resolution factor: ratio of pixel size that wildcat expects to see and the histology
+        # image we are processing
         res_factor = 1 if target_resolution is None else target_resolution / osl.spacing[0]
-        patch_size_raw = int(0.5 + input_size_wildcat * res_factor)
 
-        # Corresponding patch size in raw image (should match WildCat, no downsampling)
-        window_size_raw = int(0.5 + window_size * res_factor)
-
+        # Size of teh input patch to WildCat (should be 224)
+        patch_size_wildcat = self.config['wildcat_upsample']['input_size']
+        
+        # Compute the size of the window that will be fed into the Wildcat network. This 
+        # window should have dimensions divisible by 16. 
+        window_size_wildcat = int(0.5 + window_size / 16) * 16
+        
         # The amount of padding, relative to patch size to add to the window. This padding
         # is to provide context at the edges of the window
         padding_size_rel = 1.0
-        padding_size_raw = int(padding_size_rel * patch_size_raw)
 
         # Factor by which wildcat shrinks input images when mapping to segmentations
         wildcat_shrinkage = 2
 
+        # Window size in the histology image
+        window_size_raw = int(0.5 + window_size_wildcat * res_factor)
+        
+        # Padding size in the histology image
+        padding_size_raw = int(0.5 + padding_size_rel * patch_size_wildcat * res_factor)
+        
         # Size of output pixel (in input pixels)
-        out_pix_size = wildcat_shrinkage * extra_shrinkage * patch_size_raw * 1.0 / input_size_wildcat
+        out_pix_size = wildcat_shrinkage * extra_shrinkage * res_factor
 
         # The output size for each window
-        window_size_out = int(window_size_raw / out_pix_size)
-
-        # The padding size for the output
-        padding_size_out = int(padding_size_rel * patch_size_raw / out_pix_size)
+        window_size_out = window_size_wildcat // (wildcat_shrinkage * extra_shrinkage)
 
         # Total number of non-overlapping windows to process
         n_win = np.ceil(slide_dim / window_size_raw).astype(int)
@@ -182,7 +188,8 @@ class TrainedWildcat:
 
         # Output array (last dimension is per-class probabilities)
         num_classes = self.config['num_classes']
-        density = np.zeros((num_classes, out_dim[0], out_dim[1]))
+        den_channels = num_classes + 3 if add_rgb_to_density else num_classes
+        density = np.zeros((den_channels, out_dim[0], out_dim[1]))
 
         # Range of pixels to scan
         u_range, v_range = (0, n_win[0]), (0, n_win[1])
@@ -197,7 +204,7 @@ class TrainedWildcat:
             else:
                 u_range = (int(region[0]), int(region[0] + region[2]))
                 v_range = (int(region[1]), int(region[1] + region[3]))
-
+                
         print('Procesing region [%d %d] to [%d %d]' % (u_range[0], v_range[0], u_range[1], v_range[1]))
 
         # Set up a threaded worker to read openslide patches
@@ -223,14 +230,36 @@ class TrainedWildcat:
                 # Get the values
                 ((u, v), (x, y, w), (xp, yp, wp), chunk_img) = q_data
 
-                # Compute the desired size of input to wildcat
-                wwc = int(wp * input_size_wildcat / patch_size_raw)
-
-                # Resample the chunk for the two networks
+                # Compute the desired size of input to wildcat. We want this to be divisible
+                # by 16. However the actual wp we get might not be. For example, let's say
+                # wp = 512 and res_factor is 1.2. Then wp_wc will be rounded down to 416. The
+                # corresponding region of the input chunk will be of size 499.2, i.e. not exactly
+                # the same as wp. We need to then extract the center region of that size from the
+                # chunk_img and feed that to the transform.
+                wp_wc = int(wp / (16 * res_factor)) * 16
+                wp_adj = int(0.5 + wp_wc * res_factor)
+                
+                # A sequence of transforms to apply to the window before inputting it to wildcat
                 tran = transforms.Compose([
-                    transforms.Resize((wwc, wwc)),
+                    transforms.CenterCrop((wp_adj, wp_adj)),
+                    transforms.Resize((wp_wc, wp_wc)),
                     transforms.ToTensor(),
                     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+                ])
+                
+                # A sequence of transforms to apply to the wildcat output to obtain the density
+                w_wcout = window_size_wildcat // wildcat_shrinkage
+                tran_out = transforms.Compose([
+                    transforms.CenterCrop((w_wcout, w_wcout)),
+                    transforms.Resize((window_size_out, window_size_out), antialias=True)
+                ])
+                
+                # An optional transform to apply to the input intensity, if the user requests that to
+                # be appended to the output
+                tran_rgb_ds = transforms.Compose([
+                    transforms.CenterCrop((window_size_raw, window_size_raw)),
+                    transforms.Resize((window_size_out, window_size_out), antialias=True),
+                    transforms.ToTensor()
                 ])
 
                 # Convert the read chunk to tensor format
@@ -242,20 +271,21 @@ class TrainedWildcat:
                     # Forward pass through the wildcat model
                     x_clas = self.model_ft.forward_to_classifier(chunk_tensor)
                     x_cpool = self.model_ft.spatial_pooling.class_wise(x_clas)
-
-                    # Scale the cpool image to desired size
-                    x_cpool_up = torch.nn.functional.interpolate(x_cpool,
-                                                                scale_factor=1.0 / extra_shrinkage).detach().cpu().numpy()
-
-                    # Extract the central portion of the output
-                    p0, p1 = padding_size_out, (padding_size_out + window_size_out)
-                    x_cpool_ctr = x_cpool_up[:, :, p0:p1, p0:p1]
-
+                    
+                    # Apply additional downsampling
+                    x_cpool_ctr = tran_out(x_cpool).detach().cpu().numpy()
+                    
                     # Stick it into the output array
                     xout0, xout1 = u * window_size_out, ((u + 1) * window_size_out)
                     yout0, yout1 = v * window_size_out, ((v + 1) * window_size_out)
                     for j in range(num_classes):
                         density[j, xout0:xout1, yout0:yout1] = x_cpool_ctr[0, j, :, :].transpose()
+                        
+                    # Optionally add downsampled RGB to the intensity
+                    if add_rgb_to_density:
+                        rgb_ds = tran_rgb_ds(chunk_img).detach().cpu().numpy()
+                        for j in range(3):
+                            density[num_classes+j, xout0:xout1, yout0:yout1] = rgb_ds[j,:,:].transpose()
                         
                 # Finished first pass through the chunk
                 t2 = timeit.default_timer()
