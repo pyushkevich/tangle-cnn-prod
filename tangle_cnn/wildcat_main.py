@@ -19,10 +19,9 @@ import parse
 import glob
 import traceback
 import matplotlib.pyplot as plt
-from osl_worker import osl_worker, osl_read_chunk_from_queue
-import wildcat_pytorch.wildcat as wildcat
-from wildcat_pytorch.picsl_wildcat import models, util, losses
-from unet_wildcat_gmm import UNet_WSL_GMM
+from .osl_worker import osl_worker, osl_read_chunk_from_queue
+from .wildcat_pytorch.picsl_wildcat import models, util, losses
+from .unet_wildcat_gmm import UNet_WSL_GMM
 from PIL import Image
 import pandas as pd
 
