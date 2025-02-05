@@ -76,9 +76,12 @@ class SimpleITKHistologyDataSource(HistologyDataSource):
         return np.array(self._src_image.GetSpacing())[:2]
     
     def read_region(self, location, level, size):
-        crop = sitk.RegionOfInterest(self._byte_image, size=(wp,wp), index=(xp,yp))
-        chunk_np = sitk.GetArrayFromImage(crop).astype('uint8')
-        return Image.fromarray(chunk_np)
+        x,y = location
+        w,h = size
+        return self._byte_image.crop((x,y,x+w,y+h))
+        #crop = sitk.RegionOfInterest(self._byte_image, size=[w,h,1], index=[x,y,0])
+        #chunk_np = sitk.GetArrayFromImage(crop).astype('uint8')
+        #return Image.fromarray(chunk_np)
 
 # Define the worker function to load chunks from the openslide image
 def osl_worker(osl, u_range, v_range, window_size_raw, padding_size_raw):

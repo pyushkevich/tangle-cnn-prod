@@ -499,8 +499,8 @@ def train_model(model, dataloaders, criterion, optimizer, num_epochs=25):
                             optimizer.step()
 
                 # Print minimatch stats
-                print('MB %04d/%04d  loss %f  corr %d' %
-                      (mb, nmb, loss.item(), torch.sum(preds == labels.data).item()))
+                print('MB %04d/%04d  loss %f  corr %d/%d' %
+                      (mb, nmb, loss.item(), torch.sum(preds == labels.data).item(), preds.shape[0]))
 
                 # statistics
                 running_loss += loss.item() * inputs.size(0)
@@ -960,16 +960,17 @@ def do_val(arg):
 # Function to apply training to a slide
 def do_apply(args):
     wc = TrainedWildcat(args.modeldir)
-    if args.reader == 'osl':
+    if args.reader == 'openslide':
         osl = openslide.OpenSlide(args.slide)
-        datasource = OpenSlideHistologyDataSource(args.slide)
+        datasource = OpenSlideHistologyDataSource(osl)
     elif args.reader == 'sitk':
         img = sitk.ReadImage(args.slide)
         datasource = SimpleITKHistologyDataSource(img)
     else:
         raise ValueError(f'Unsupported reader {args.reader}')
     
-    nii = wc.apply(datasource, args.window, args.shrink, args.region)
+    nii = wc.apply(osl=datasource, window_size=args.window, extra_shrinkage=args.shrink, 
+                   region=args.region)
     sitk.WriteImage(nii, args.output)
 
 # Set up an argument parser
@@ -1034,9 +1035,9 @@ apply_parser.add_argument('--slide', help='Input histology slide to process')
 apply_parser.add_argument('--reader', choices=['openslide', 'pillow', 'sitk'], help='Reader to use for the slide', default='openslide')
 apply_parser.add_argument('--modeldir', help='Directory containing the model')
 apply_parser.add_argument('--output', help='Where to store the output density map')
-apply_parser.add_argument('--region', help='Region of image to process (x,y,w,h)', nargs=4)
-apply_parser.add_argument('--window', help='Size of the window for scanning', default=4096)
-apply_parser.add_argument('--shrink', help='How much to downsample WildCat output', default=4)
+apply_parser.add_argument('--region', help='Region of image to process (x,y,w,h)', nargs=4, type=int)
+apply_parser.add_argument('--window', help='Size of the window for scanning', default=4096, type=int)
+apply_parser.add_argument('--shrink', help='How much to downsample WildCat output', default=4, type=int)
 apply_parser.add_argument('--manifest', type=str, help='Read input and output data from a manifest .csv file, columns must include slide,output')
 apply_parser.set_defaults(func=do_apply)
 
@@ -1046,7 +1047,7 @@ patch_apply_parser.add_argument('--input', help='Input directory containing patc
 patch_apply_parser.add_argument('--modeldir', help='Directory containing the model')
 patch_apply_parser.add_argument('--outdir', help='Output directory where to store density maps (optional)', nargs='+')
 patch_apply_parser.add_argument('--outstat', help='Output file where to store density histograms (optional)', nargs='+')
-patch_apply_parser.add_argument('--shrink', help='How much to downsample WildCat output', default=4)
+patch_apply_parser.add_argument('--shrink', help='How much to downsample WildCat output', default=4, type=int)
 patch_apply_parser.add_argument('--batch', help='Batch size', default=16, type=int)
 patch_apply_parser.add_argument('--scale',
                                 help='When applying to images of different resolution than '
