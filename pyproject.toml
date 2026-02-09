@@ -20,7 +20,6 @@ readme = "README.md"
 requires-python = ">=3.8"
 classifiers = [
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Intended Audience :: Science/Research",
     "Development Status :: 4 - Beta",
@@ -34,5 +33,7 @@ Homepage = "https://github.com/pyushkevich/tangle-cnn-prod"
 requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools]
-packages = ["tangle_cnn", "tangle_cnn.wildcat_pytorch"]
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["tangle_cnn*"]
+exclude = ["*.tests", "*.tests.*", "tests.*", "tests"]
