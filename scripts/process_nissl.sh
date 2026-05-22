@@ -16,8 +16,8 @@ if ! gsutil -m cp "gs://mtl_histology/$id/histo_raw/${svs}.*" ./data/; then
   exit 255
 fi
 
-# Find the file
-svslocal=$(ls ./data/${svs}.*)
+# Find the file (ignore sidecars)
+svslocal=$(ls ./data/${svs}.* | grep -v "\.json$")
 
 # Make sure the file is multi-level
 LEVELS=$(python levels.py $svslocal | awk '{print $4}')
