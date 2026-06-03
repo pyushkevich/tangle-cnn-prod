@@ -1,6 +1,6 @@
 # Need CUDA!
 # FROM anibali/pytorch:1.7.0-cuda11.0
-FROM pytorch/pytorch:1.6.0-cuda10.1-cudnn7-runtime
+FROM pytorch/pytorch:2.1.2-cuda11.8-cudnn8-runtime
 USER root
 
 # Some packages
@@ -9,7 +9,7 @@ RUN apt-get update
 RUN apt-get install -y wget curl gcc openslide-tools vim
 
 # Downloading gcloud package
-RUN curl https://dl.google.com/dl/cloudsdk/release/google-cloud-sdk.tar.gz > /tmp/google-cloud-sdk.tar.gz
+RUN curl https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-linux-x86_64.tar.gz > /tmp/google-cloud-sdk.tar.gz
 
 # Create a working directory
 RUN mkdir /app
@@ -27,7 +27,7 @@ RUN chmod 777 /home/user
 
 # Installing the package
 RUN mkdir -p /usr/local/gcloud \
-  && tar -C /usr/local/gcloud -xvf /tmp/google-cloud-sdk.tar.gz \
+  && tar -C /usr/local/gcloud -xzvf /tmp/google-cloud-sdk.tar.gz \
   && bash /usr/local/gcloud/google-cloud-sdk/install.sh --quiet \
   && chown -R user:user /home/user/.config
 
@@ -60,6 +60,7 @@ RUN pip install -r /app/requirements.txt
 
 # Copy internals
 COPY . /app/
+RUN pip install -e .
 
 # Switch to our user
 USER user

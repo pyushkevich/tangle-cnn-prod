@@ -41,10 +41,12 @@ if ! gsutil -m cp "${MODEL_URL}" ./model/; then
 fi
 
 # Run the code
+pushd tangle_cnn
 python -u nissl_to_multichannel.py apply \
-  --slide $svslocal \
-  --output ./data/result.nii.gz --window 8192 \
-  --network ./model/deepcluster.alexnet.tar
+  --slide ../$svslocal \
+  --output ../data/result.nii.gz --window 8192 \
+  --network ../model/deepcluster.alexnet.tar
+popd
 
 # Copy result up to storage
 for ext in 'nii.gz' 'tiff'; do
