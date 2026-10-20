@@ -14,7 +14,8 @@ dependencies = [
     'openslide-python',
     'SimpleITK',
     'parse',
-    'Pillow'
+    'Pillow',
+    'pandas'
 ]
 readme = "README.md"
 requires-python = ">=3.8"

@@ -85,7 +85,7 @@ fi
 # Run the code
 for svslocal in $WDIR/data/*.jpg; do
   svs=$(basename $svslocal .jpg)
-  python -u blockface_to_multichannel.py apply \
+  python -u -m tangle_cnn.blockface_to_multichannel apply \
     --slide $svslocal \
     --output $WDIR/data/${svs}_deepcluster.nii.gz \
     --thumb $WDIR/data/${svs}_deepcluster_rgb.nii.gz \

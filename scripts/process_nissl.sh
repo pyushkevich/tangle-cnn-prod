@@ -20,7 +20,7 @@ fi
 svslocal=$(ls ./data/${svs}.* | grep -v "\.json$")
 
 # Make sure the file is multi-level
-LEVELS=$(python levels.py $svslocal | awk '{print $4}')
+LEVELS=$(python -m tangle_cnn.levels $svslocal | awk '{print $4}')
 if [[ $LEVELS -le 1 ]]; then
   
   mkdir -p ./data/fixflat
@@ -41,12 +41,10 @@ if ! gsutil -m cp "${MODEL_URL}" ./model/; then
 fi
 
 # Run the code
-pushd tangle_cnn
-python -u nissl_to_multichannel.py apply \
-  --slide ../$svslocal \
-  --output ../data/result.nii.gz --window 8192 \
-  --network ../model/deepcluster.alexnet.tar
-popd
+python -u -m tangle_cnn.nissl_to_multichannel apply \
+  --slide $svslocal \
+  --output ./data/result.nii.gz --window 8192 \
+  --network ./model/deepcluster.alexnet.tar
 
 # Copy result up to storage
 for ext in 'nii.gz' 'tiff'; do

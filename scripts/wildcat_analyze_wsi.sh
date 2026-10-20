@@ -97,7 +97,7 @@ else
 fi
 
 # Make sure the file is multi-level
-LEVELS=$(python levels.py "$SLIDE_URL" | awk '{print $4}')
+LEVELS=$(python -m tangle_cnn.levels "$SLIDE_URL" | awk '{print $4}')
 if [[ $LEVELS -le 1 ]]; then
   mkdir -p "$WDIR/fixflat"
   SLIDE_FIXFLAT="$WDIR/fixflat/$SLIDE_BN_NOEXT.tiff"
@@ -110,7 +110,7 @@ if [[ $LEVELS -le 1 ]]; then
 fi
 
 # Perform the scanning in Python
-python -u wildcat_main.py apply \
+python -u -m tangle_cnn apply \
   --modeldir "$NETWORK_URL" \
   --slide "$SLIDE_URL" \
   --output "$DENSITY_NII" \

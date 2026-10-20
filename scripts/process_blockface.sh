@@ -29,7 +29,7 @@ if ! gsutil -m cp "${MODEL_URL}" ./model/; then
 fi
 
 # Run the code
-python -u blockface_to_multichannel.py apply \
+python -u -m tangle_cnn.blockface_to_multichannel apply \
   --slide $svslocal \
   --output ./data/result.nii.gz \
   --network ./model/deepcluster.alexnet.tar \

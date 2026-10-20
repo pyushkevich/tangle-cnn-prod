@@ -65,6 +65,4 @@ RUN pip install -e .
 # Switch to our user
 USER user
 
-# Add pythonpath
-ENV PYTHONPATH=/app/wildcat.pytorch:$PYTHONPATH
 

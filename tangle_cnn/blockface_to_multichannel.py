@@ -6,9 +6,10 @@ import argparse
 import SimpleITK as sitk
 from PIL import Image
 import sys
+import os
 
-sys.path.append("deepcluster")
-from deepcluster.util import load_model
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "deepcluster"))
+from .deepcluster.util import load_model
 
 
 # Process a slide

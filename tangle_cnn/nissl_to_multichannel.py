@@ -13,11 +13,11 @@ import argparse
 import parse
 import SimpleITK as sitk
 import threading
-from osl_worker import osl_worker, osl_read_chunk_from_queue
+from .osl_worker import osl_worker, osl_read_chunk_from_queue
 
 # Deepcluster
-sys.path.append("deepcluster")
-from deepcluster.util import load_model
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "deepcluster"))
+from .deepcluster.util import load_model
 
 
 def run_model_on_window(model, W):
