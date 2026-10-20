@@ -1,6 +1,6 @@
 # Tangle-CNN Package
 
-This package contains Python scripts to train and apply weakly supervised segmentation models based on the WildCat algorithm (Durand, CVPR 2017) in the context of detection and segmentation of pathological inclusions, such as neurofibrillary tangles, in digital pathology images in neurodegenerative disorders. For additional details, please read (Yushkevich et al., Brain 2021), (Ravikumar et al., Nature Communications, 2024) and (Denning et al., Acta Neuropathologica, 2024).
+This package contains Python scripts to train and apply weakly supervised segmentation models based on the WildCat algorithm ([Durand et al., CVPR 2017](https://doi.org/10.1109/CVPR.2017.631)) in the context of detection and segmentation of pathological inclusions, such as neurofibrillary tangles, in digital pathology images in neurodegenerative disorders. For additional details, please read [Yushkevich et al., Brain 2021](https://doi.org/10.1093/brain/awab262), [Ravikumar et al., Nature Communications 2024](https://doi.org/10.1038/s41467-024-49205-0) and [Denning et al., Acta Neuropathologica 2024](https://doi.org/10.1007/s00401-024-02789-9).
 
 ## Overview
 
@@ -19,13 +19,23 @@ Key features:
 - Python >= 3.8
 - CUDA-capable GPU (recommended for training and inference)
 
-### Install from source
+### Install from PyPI
 
 ```bash
-git clone https://github.com/pyushkevich/tangle-cnn-prod.git
+pip install tangle-cnn
+```
+
+### Install from source
+
+To use the latest development version, or to modify the code, install from a clone of the repository in editable mode:
+
+```bash
+git clone --recursive https://github.com/pyushkevich/tangle-cnn-prod.git
 cd tangle-cnn-prod
 pip install -e .
 ```
+
+The `wildcat_pytorch` code is included as a git submodule, so `--recursive` is required. If you already cloned without it, run `git submodule update --init --recursive` before installing.
 
 ### Dependencies
 
@@ -45,7 +55,7 @@ These dependencies will be automatically installed during package installation.
 
 ## Usage
 
-The package provides a command-line interface with four main subcommands:
+The package provides a command-line interface with five subcommands:
 
 ### 1. Training a Model
 
@@ -70,7 +80,7 @@ python -m tangle_cnn train \
 - `--nmaps`: Number of maps per class
 - `--bbox`: Use bounding box constraints (requires manifest file)
 - `--scale`: Scale patches to target resolution for multi-resolution training
-- `--color-jitter`: Apply color jitter augmentation
+- `--color-jitter B C S H`: Apply color jitter augmentation with the given brightness, contrast, saturation and hue (see `torchvision.transforms.ColorJitter`)
 - `--lr`: Learning rate (default: 0.01)
 - `--resume`: Resume from saved checkpoint
 
@@ -88,7 +98,7 @@ python -m tangle_cnn validate \
 **Validation options:**
 - `--expdir`: Experiment directory with trained model
 - `--batch`: Batch size for evaluation
-- `--target`: Dataset to evaluate ('test' or other)
+- `--target`: Subdirectory of `patches/` to evaluate (default: `test`)
 - `--manifest`: Manifest file (if training used --bbox or --scale)
 
 ### 3. Applying to Whole-Slide Images
@@ -112,6 +122,7 @@ python -m tangle_cnn apply \
 - `--window`: Window size for slide scanning (default: 4096)
 - `--shrink`: Downsampling factor for output (default: 4)
 - `--region`: Process only a specific region [x, y, w, h]
+- `--manifest`: CSV file with `slide` and `output` columns, to process multiple slides in one run
 
 ### 4. Applying to Image Patches
 
@@ -129,7 +140,8 @@ python -m tangle_cnn patch_apply \
 - `--input`: Input directory or directories containing patches
 - `--modeldir`: Directory containing trained model
 - `--outdir`: Output directory for density maps
-- `--outstat`: Output file for density statistics
+- `--outstat`: Output file for density histograms
+- `--shrink`: Downsampling factor for output (default: 4)
 - `--batch`: Batch size (default: 16)
 - `--scale`: Resolution scaling factor for multi-resolution inference
 
@@ -157,28 +169,31 @@ experiment_dir/
 │   │   └── class2/
 │   │       ├── image1.png
 │   │       └── image2.png
-│   └── val/
+│   ├── val/
+│   │   ├── class1/
+│   │   └── class2/
+│   └── test/          # used by 'validate' (default --target)
 │       ├── class1/
 │       └── class2/
-└── models/
+└── models/            # created by 'train'
     ├── config.json
     └── wildcat_upsample.dat
 ```
 
 ### Manifest File Format
 
-When using `--bbox` or `--scale` options, provide a CSV manifest with columns:
-- For bounding boxes: `filename`, `x`, `y`, `width`, `height`
-- For scaling: `filename`, `mpp_x`, `mpp_y` (microns per pixel)
+When using `--bbox` or `--scale` options, provide a CSV manifest via `--manifest`. Patch filenames must be integer IDs (e.g. `1234.png`), and the manifest must contain an `id` column matching them, plus:
+- For bounding boxes (`--bbox`): `w`, `h` — width and height of a box centered in the patch, in pixels
+- For scaling (`--scale`): `mpp_x`, `mpp_y` — pixel size of the patch, in the same units as the `--scale` target resolution
 
 ## References
 
 If you use this package, please cite the following publications:
 
-1. Yushkevich et al., "Deep learning analysis of tau pathology in postmortem human hippocampus" *Brain*, 2021
-2. Ravikumar et al., "Deep learning methods detect tau pathology in early Alzheimer's disease using multimodal digitized slides" *Nature Communications*, 2024
-3. Denning et al., "Spatial quantification of tau pathology in progressive supranuclear palsy" *Acta Neuropathologica*, 2024
-4. Durand et al., "WILDCAT: Weakly Supervised Learning of Deep ConvNets for Image Classification, Pointwise Localization and Segmentation" *CVPR*, 2017
+1. Yushkevich PA, et al. "Three-dimensional mapping of neurofibrillary tangle burden in the human medial temporal lobe." *Brain*. 2021;144(9):2784–2797. [doi:10.1093/brain/awab262](https://doi.org/10.1093/brain/awab262)
+2. Ravikumar S, et al. "Postmortem imaging reveals patterns of medial temporal lobe vulnerability to tau pathology in Alzheimer's disease." *Nature Communications*. 2024;15(1):4803. [doi:10.1038/s41467-024-49205-0](https://doi.org/10.1038/s41467-024-49205-0)
+3. Denning AE, et al. "Association of quantitative histopathology measurements with antemortem medial temporal lobe cortical thickness in the Alzheimer's disease continuum." *Acta Neuropathologica*. 2024;148(1):37. [doi:10.1007/s00401-024-02789-9](https://doi.org/10.1007/s00401-024-02789-9)
+4. Durand T, Mordan T, Thome N, Cord M. "WILDCAT: Weakly Supervised Learning of Deep ConvNets for Image Classification, Pointwise Localization and Segmentation." *IEEE Conference on Computer Vision and Pattern Recognition (CVPR)*. 2017:5957–5966. [doi:10.1109/CVPR.2017.631](https://doi.org/10.1109/CVPR.2017.631)
 
 ## License
 
