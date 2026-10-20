@@ -197,7 +197,9 @@ If you use this package, please cite the following publications:
 
 ## License
 
-This project is licensed under the GNU General Public License v3.0 - see the [LICENSE.txt](LICENSE.txt) file for details.
+This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
+
+The bundled submodules are distributed under their own licenses: `tangle_cnn/wildcat_pytorch` (MIT) and `tangle_cnn/deepcluster` (CC BY-NC 4.0, non-commercial use only).
 
 ## Authors
 
