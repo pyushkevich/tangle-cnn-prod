@@ -64,7 +64,7 @@ def make_model(config, pretrained=True):
     else:
         model = models.resnet50_wildcat_upsample(
             config['num_classes'],
-            pretrained=True,
+            pretrained=pretrained,
             kmax=mcfg['kmax'],
             kmin=mcfg['kmin'],
             alpha=mcfg['alpha'],

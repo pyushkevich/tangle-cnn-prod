@@ -1,68 +1,44 @@
-# Need CUDA!
-# FROM anibali/pytorch:1.7.0-cuda11.0
-FROM pytorch/pytorch:2.1.2-cuda11.8-cudnn8-runtime
-USER root
+# Runtime image for tangle-cnn jobs on GKE GPU nodes.
+# Build from the repository root (with submodules checked out):
+#   docker buildx build --platform linux/amd64 -f docker/Dockerfile -t pyushkevich/tangle-cnn-prod:<version> .
+# CUDA 12.6 runs on the NVIDIA drivers GKE installs by default.
+FROM pytorch/pytorch:2.14.1-cuda12.6-cudnn9-runtime
 
-# Some packages
 ARG DEBIAN_FRONTEND=noninteractive
-RUN apt-get update
-RUN apt-get install -y wget curl gcc openslide-tools vim
 
-# Downloading gcloud package
-RUN curl https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-linux-x86_64.tar.gz > /tmp/google-cloud-sdk.tar.gz
+# Tools used by the job scripts: vips (tiffsave) and the Google Cloud CLI (gcloud, gsutil)
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl gnupg libvips-tools \
+ && curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
+      | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg \
+ && echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" \
+      > /etc/apt/sources.list.d/google-cloud-sdk.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends google-cloud-cli \
+ && rm -rf /var/lib/apt/lists/*
 
-# Create a working directory
-RUN mkdir /app
 WORKDIR /app
 
-# Create a non-root user and switch to it
-RUN adduser --disabled-password --gecos '' --shell /bin/bash user \
- && chown -R user:user /app
-RUN apt-get install -y sudo
-RUN echo "user ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/90-user
+# The base image installs PyTorch into the system Python (Ubuntu 24.04), so allow pip to
+# install there too; there is no OS Python to protect inside this container
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
 
-# All users can use /home/user as their home directory
-ENV HOME=/home/user
-RUN chmod 777 /home/user
+# Install dependencies first, so that code changes don't invalidate this layer.
+# PyTorch and torchvision come from the base image.
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Installing the package
-RUN mkdir -p /usr/local/gcloud \
-  && tar -C /usr/local/gcloud -xzvf /tmp/google-cloud-sdk.tar.gz \
-  && bash /usr/local/gcloud/google-cloud-sdk/install.sh --quiet \
-  && chown -R user:user /home/user/.config
+# Install the package itself
+COPY pyproject.toml README.md LICENSE ./
+COPY tangle_cnn ./tangle_cnn
+RUN pip install --no-cache-dir --no-deps .
 
-# Adding the package path to local
-ENV PATH $PATH:/usr/local/gcloud/google-cloud-sdk/bin
+# Job scripts, callable by name from GKE job specs
+COPY --chmod=755 scripts ./scripts
+ENV PATH=/app/scripts:$PATH
 
-# Install VIPS
-RUN apt-get install -y build-essential pkg-config glib2.0-dev
-RUN apt-get install -y libexpat1-dev libtiff5-dev libjpeg-dev libgsf-1-dev
-ARG VIPS_VERSION=8.8.0
-ARG VIPS_URL=https://github.com/libvips/libvips/releases/download
-RUN wget ${VIPS_URL}/v${VIPS_VERSION}/vips-${VIPS_VERSION}.tar.gz \
-  && tar xf vips-${VIPS_VERSION}.tar.gz \
-  && cd vips-${VIPS_VERSION} \
-  && ./configure \
-  && make V=0 -j $(nproc) \
-  && make install
-
-# Needed by VIPS
-ENV LD_LIBRARY_PATH /usr/local/lib:$LD_LIBRARY_PATH
-
-# Install C3D
-ARG C3D_URL=https://sourceforge.net/projects/c3d/files/c3d/Nightly/c3d-nightly-Linux-gcc64.tar.gz
-RUN wget -q ${C3D_URL} \
- && tar -zxvf c3d-nightly-Linux-gcc64.tar.gz --strip 1 -C /usr/local
-
-# Run pip
-COPY requirements.txt /app/
-RUN pip install -r /app/requirements.txt
-
-# Copy internals
-COPY . /app/
-RUN pip install -e .
-
-# Switch to our user
+# Run as a non-root user with a writable working directory
+RUN useradd --create-home --shell /bin/bash user \
+ && mkdir -p /work && chown user:user /work
 USER user
-
-
+WORKDIR /work
