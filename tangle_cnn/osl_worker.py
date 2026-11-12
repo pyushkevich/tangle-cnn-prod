@@ -84,9 +84,15 @@ class SimpleITKHistologyDataSource(HistologyDataSource):
         #return Image.fromarray(chunk_np)
 
 # Define the worker function to load chunks from the openslide image
-def osl_worker(osl, u_range, v_range, window_size_raw, padding_size_raw):
+def osl_worker(osl, u_range, v_range, window_size_raw, padding_size_raw, stop_event=None,
+               transform=None, pin_memory=False):
     for u in range(u_range[0], u_range[1]):
         for v in range(v_range[0], v_range[1]):
+            # Stop early if the consumer has given up (e.g., after an error)
+            if stop_event is not None and stop_event.is_set():
+                chunk_q.put(None)
+                return
+
             # Get the coordinates of the window in raw pixels
             x, y, w = u * window_size_raw, v * window_size_raw, window_size_raw
 
@@ -96,8 +102,15 @@ def osl_worker(osl, u_range, v_range, window_size_raw, padding_size_raw):
             # Read the chunk from the image
             chunk_img = osl.read_region((xp, yp), 0, (wp, wp)).convert("RGB")
 
-            # Place into queue
-            chunk_q.put(((u, v), (x, y, w), (xp, yp, wp), chunk_img))
+            # Optionally convert the chunk to a network-ready tensor here, so that this
+            # work overlaps with inference in the consumer thread
+            if transform is not None:
+                chunk_tensor = transform(chunk_img)
+                if pin_memory:
+                    chunk_tensor = chunk_tensor.pin_memory()
+                chunk_q.put(((u, v), (x, y, w), (xp, yp, wp), chunk_img, chunk_tensor))
+            else:
+                chunk_q.put(((u, v), (x, y, w), (xp, yp, wp), chunk_img))
 
     # Put a sentinel value
     chunk_q.put(None)
@@ -106,5 +119,18 @@ def osl_worker(osl, u_range, v_range, window_size_raw, padding_size_raw):
 # Read from the OSL worker queue
 def osl_read_chunk_from_queue():
     return chunk_q.get()
+
+
+# Stop the OSL worker and empty the queue, so that the worker thread can exit and
+# the queue holds no stale chunks for the next run
+def osl_stop_worker(worker, stop_event):
+    stop_event.set()
+    while worker.is_alive():
+        try:
+            chunk_q.get(timeout=0.1)
+        except queue.Empty:
+            pass
+    while not chunk_q.empty():
+        chunk_q.get_nowait()
 
 

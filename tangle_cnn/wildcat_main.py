@@ -19,7 +19,7 @@ import parse
 import glob
 import traceback
 import matplotlib.pyplot as plt
-from .osl_worker import osl_worker, osl_read_chunk_from_queue
+from .osl_worker import osl_worker, osl_read_chunk_from_queue, osl_stop_worker
 from .osl_worker import HistologyDataSource, OpenSlideHistologyDataSource, SimpleITKHistologyDataSource
 from .wildcat_pytorch.picsl_wildcat import models, util, losses
 from .unet_wildcat_gmm import UNet_WSL_GMM
@@ -85,14 +85,20 @@ def make_model(config, pretrained=True):
 
 class TrainedWildcat:
     
-    def __init__(self, modeldir, device=None):
-        
+    def __init__(self, modeldir, device=None, fp16=False):
+
         # Set the model directory
         self.model_dir = modeldir
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.device = device
-        print(f'TrainedWildcat {modeldir} on device {self.device}')
+        self.device = torch.device(device)
+
+        # Half precision inference uses tensor cores and is only supported on CUDA
+        if fp16 and self.device.type != 'cuda':
+            print('Warning: --fp16 requires a CUDA device, running in full precision')
+            fp16 = False
+        self.fp16 = fp16
+        print(f'TrainedWildcat {modeldir} on device {self.device}, fp16={self.fp16}')
 
         # Read the model's .json config file
         with open(os.path.join(self.model_dir, 'config.json')) as json_file:
@@ -109,6 +115,10 @@ class TrainedWildcat:
         # Send model to GPU
         self.model_ft.eval()
         self.model_ft = self.model_ft.to(self.device)
+
+        # For half precision, use the channels-last memory layout preferred by tensor cores
+        if self.fp16:
+            self.model_ft = self.model_ft.to(memory_format=torch.channels_last)
         
     @property
     def suffix(self):
@@ -207,8 +217,45 @@ class TrainedWildcat:
                 
         print('Procesing region [%d %d] to [%d %d]' % (u_range[0], v_range[0], u_range[1], v_range[1]))
 
+        # Compute the desired size of input to wildcat. We want this to be divisible
+        # by 16. However the actual wp we get might not be. For example, let's say
+        # wp = 512 and res_factor is 1.2. Then wp_wc will be rounded down to 416. The
+        # corresponding region of the input chunk will be of size 499.2, i.e. not exactly
+        # the same as wp. We need to then extract the center region of that size from the
+        # chunk_img and feed that to the transform.
+        wp = window_size_raw + 2 * padding_size_raw
+        wp_wc = int(wp / (16 * res_factor)) * 16
+        wp_adj = int(0.5 + wp_wc * res_factor)
+
+        # A sequence of transforms to apply to the window before inputting it to wildcat.
+        # This is applied in the reader thread, so it overlaps with inference on the GPU
+        tran = transforms.Compose([
+            transforms.CenterCrop((wp_adj, wp_adj)),
+            transforms.Resize((wp_wc, wp_wc)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ])
+
+        # A sequence of transforms to apply to the wildcat output to obtain the density
+        w_wcout = window_size_wildcat // wildcat_shrinkage
+        tran_out = transforms.Compose([
+            transforms.CenterCrop((w_wcout, w_wcout)),
+            transforms.Resize((window_size_out, window_size_out), antialias=True)
+        ])
+
+        # An optional transform to apply to the input intensity, if the user requests that to
+        # be appended to the output
+        tran_rgb_ds = transforms.Compose([
+            transforms.CenterCrop((window_size_raw, window_size_raw)),
+            transforms.Resize((window_size_out, window_size_out), antialias=True),
+            transforms.ToTensor()
+        ])
+
         # Set up a threaded worker to read openslide patches
-        worker = threading.Thread(target=osl_worker, args=(osl, u_range, v_range, window_size_raw, padding_size_raw))
+        stop_event = threading.Event()
+        pin = self.device.type == 'cuda'
+        worker = threading.Thread(target=osl_worker, args=(osl, u_range, v_range, window_size_raw, padding_size_raw,
+                                                           stop_event, tran, pin))
         worker.start()
         
         # Try/catch block to kill worker when done
@@ -228,49 +275,21 @@ class TrainedWildcat:
                     break
 
                 # Get the values
-                ((u, v), (x, y, w), (xp, yp, wp), chunk_img) = q_data
-
-                # Compute the desired size of input to wildcat. We want this to be divisible
-                # by 16. However the actual wp we get might not be. For example, let's say
-                # wp = 512 and res_factor is 1.2. Then wp_wc will be rounded down to 416. The
-                # corresponding region of the input chunk will be of size 499.2, i.e. not exactly
-                # the same as wp. We need to then extract the center region of that size from the
-                # chunk_img and feed that to the transform.
-                wp_wc = int(wp / (16 * res_factor)) * 16
-                wp_adj = int(0.5 + wp_wc * res_factor)
-                
-                # A sequence of transforms to apply to the window before inputting it to wildcat
-                tran = transforms.Compose([
-                    transforms.CenterCrop((wp_adj, wp_adj)),
-                    transforms.Resize((wp_wc, wp_wc)),
-                    transforms.ToTensor(),
-                    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-                ])
-                
-                # A sequence of transforms to apply to the wildcat output to obtain the density
-                w_wcout = window_size_wildcat // wildcat_shrinkage
-                tran_out = transforms.Compose([
-                    transforms.CenterCrop((w_wcout, w_wcout)),
-                    transforms.Resize((window_size_out, window_size_out), antialias=True)
-                ])
-                
-                # An optional transform to apply to the input intensity, if the user requests that to
-                # be appended to the output
-                tran_rgb_ds = transforms.Compose([
-                    transforms.CenterCrop((window_size_raw, window_size_raw)),
-                    transforms.Resize((window_size_out, window_size_out), antialias=True),
-                    transforms.ToTensor()
-                ])
+                ((u, v), (x, y, w), (xp, yp, wp), chunk_img, chunk_tensor) = q_data
 
                 # Convert the read chunk to tensor format
                 with torch.no_grad():
 
-                    # Apply transforms and turn into correct-size torch tensor
-                    chunk_tensor = torch.unsqueeze(tran(chunk_img), dim=0).to(self.device)
+                    # The reader thread has already transformed the chunk into a tensor
+                    chunk_tensor = torch.unsqueeze(chunk_tensor, dim=0).to(self.device, non_blocking=True)
+                    if self.fp16:
+                        chunk_tensor = chunk_tensor.contiguous(memory_format=torch.channels_last)
 
                     # Forward pass through the wildcat model
-                    x_clas = self.model_ft.forward_to_classifier(chunk_tensor)
-                    x_cpool = self.model_ft.spatial_pooling.class_wise(x_clas)
+                    with torch.autocast(device_type=self.device.type, dtype=torch.float16, enabled=self.fp16):
+                        x_clas = self.model_ft.forward_to_classifier(chunk_tensor)
+                        x_cpool = self.model_ft.spatial_pooling.class_wise(x_clas)
+                    x_cpool = x_cpool.float()
                     
                     # Apply additional downsampling
                     x_cpool_ctr = tran_out(x_cpool).detach().cpu().numpy()
@@ -303,9 +322,9 @@ class TrainedWildcat:
             sys.exit(-1)
 
         finally:
-            worker.join(60)
-            if worker.is_alive():
-                print('Thread worker failed to terminate after 60 seconds')
+            # On error the worker may be blocked on a full queue, so stop it and
+            # drain the queue rather than waiting on it
+            osl_stop_worker(worker, stop_event)
 
         # Crop the density image either to the whole image size or to the size of the
         # region processed
@@ -959,7 +978,7 @@ def do_val(arg):
 
 # Function to apply training to a slide
 def do_apply(args):
-    wc = TrainedWildcat(args.modeldir)
+    wc = TrainedWildcat(args.modeldir, fp16=args.fp16)
     if args.reader == 'openslide':
         osl = openslide.OpenSlide(args.slide)
         datasource = OpenSlideHistologyDataSource(osl)
@@ -1038,6 +1057,8 @@ apply_parser.add_argument('--output', help='Where to store the output density ma
 apply_parser.add_argument('--region', help='Region of image to process (x,y,w,h)', nargs=4, type=int)
 apply_parser.add_argument('--window', help='Size of the window for scanning', default=4096, type=int)
 apply_parser.add_argument('--shrink', help='How much to downsample WildCat output', default=4, type=int)
+apply_parser.add_argument('--fp16', action='store_true',
+                          help='Run inference in half precision (CUDA only). Much faster on GPUs with tensor cores')
 apply_parser.add_argument('--manifest', type=str, help='Read input and output data from a manifest .csv file, columns must include slide,output')
 apply_parser.set_defaults(func=do_apply)
 
