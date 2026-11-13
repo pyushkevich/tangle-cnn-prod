@@ -33,12 +33,14 @@ COPY pyproject.toml README.md LICENSE ./
 COPY tangle_cnn ./tangle_cnn
 RUN pip install --no-cache-dir --no-deps .
 
-# Job scripts, callable by name from GKE job specs
+# Job scripts. Existing GKE job specs call them relative to /app (e.g.
+# "scripts/wildcat_analyze_wsi.sh"), so /app must stay the working directory;
+# they are also on PATH so they can be called by name.
 COPY --chmod=755 scripts ./scripts
 ENV PATH=/app/scripts:$PATH
 
-# Run as a non-root user with a writable working directory
+# Run as a non-root user. Some scripts write ./data into the working directory,
+# so /app must be writable by that user.
 RUN useradd --create-home --shell /bin/bash user \
- && mkdir -p /work && chown user:user /work
+ && chown -R user:user /app
 USER user
-WORKDIR /work
